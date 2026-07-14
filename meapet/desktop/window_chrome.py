@@ -17,9 +17,9 @@ from PyQt5.QtCore import Qt
 
 from meapet.desktop import status_language
 from meapet.desktop.icons import standard_icon
-from meapet.desktop.theme import COLOR_ACCENT, COLOR_ACCENT_2, COLOR_TEXT, MENU_STYLE
+from meapet.desktop.theme import COLOR_ACCENT, COLOR_ACCENT_2, MENU_STYLE
 from meapet.paths import PROJECT_ROOT
-from meapet.ui_theme import set_scaled_stylesheet
+from meapet.ui_theme import PALETTE, set_scaled_stylesheet
 from meapet.utils import safe_print
 
 
@@ -54,7 +54,8 @@ class PetWindowChromeMixin:
             painter.setBrush(QColor(COLOR_ACCENT))
             painter.setPen(QColor(COLOR_ACCENT_2))
             painter.drawEllipse(2, 2, 28, 28)
-            painter.setBrush(QColor(COLOR_TEXT))
+            # 粉底墨心：与 BrandMark / SplashMark 同一品牌记号
+            painter.setBrush(QColor(PALETTE["on_primary"]))
             painter.drawEllipse(10, 10, 12, 12)
             painter.end()
             icon = QIcon(pm)
