@@ -41,9 +41,14 @@ from wizard.styles import (
 from meapet.ui_theme import (
     MIN_TARGET_SIZE,
     PALETTE,
+    PET_SIZE_FACTOR_DEFAULT,
+    PET_SIZE_FACTOR_MAX,
+    PET_SIZE_FACTOR_MIN,
+    PET_SIZE_FACTOR_STEP,
     UI_FONT_SCALE_DEFAULT,
     apply_ui_font_scale,
     ensure_application_fonts,
+    normalize_pet_size_factor,
     normalize_ui_font_scale,
     set_ui_font_scale,
 )
@@ -122,9 +127,18 @@ class SetupWizard(QWidget):
         self.setObjectName("WizardRoot")
         self.setMinimumSize(760, 620)
         self.resize(880, 780)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # Use a solid dark fill instead of WA_TranslucentBackground so the
+        # wizard never shows the desktop (or the pet behind it) through any
+        # transparent region — avoids a confusing "second pet" appearance.
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor("#0E1020"))
+        self.setPalette(palette)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # Start invisible to avoid showing a blank frame before the
+        # dark-themed UI is fully painted.  Fade in once the event loop runs.
+        self.setWindowOpacity(0.0)
         self.setStyleSheet(WIZARD_STYLESHEET)
         self.setAccessibleName("MeaPet 配置")
         self.setAccessibleDescription("使用标签页配置环境、对话、语音和屏幕识图功能")
@@ -286,6 +300,13 @@ class SetupWizard(QWidget):
             self.font_scale_slider.value() / 100.0,
         )
 
+        # Use an owned QTimer to defer the fade-in until after the event
+        # loop has painted the dark-themed UI once.
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setSingleShot(True)
+        self._fade_timer.timeout.connect(lambda: self._fade_in() if self.isVisible() else None)
+        self._fade_timer.start(0)
+
     def _build_display_settings(self, initial_scale: float) -> QFrame:
         """创建独立的界面字号设置卡，并提供即时预览。"""
         card = QFrame()
@@ -341,6 +362,45 @@ class SetupWizard(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        pet_row = QHBoxLayout()
+        pet_row.setSpacing(12)
+        pet_label = QLabel("桌宠窗口大小")
+        pet_label.setObjectName("FieldLabel")
+        pet_label.setMinimumWidth(112)
+        pet_row.addWidget(pet_label)
+
+        self.pet_size_slider = QSlider(Qt.Horizontal)
+        self.pet_size_slider.setObjectName("PetSizeSlider")
+        self.pet_size_slider.setRange(
+            round(PET_SIZE_FACTOR_MIN * 100),
+            round(PET_SIZE_FACTOR_MAX * 100),
+        )
+        self.pet_size_slider.setSingleStep(round(PET_SIZE_FACTOR_STEP * 100))
+        self.pet_size_slider.setPageStep(10)
+        self.pet_size_slider.setTracking(True)
+        self.pet_size_slider.setValue(round(PET_SIZE_FACTOR_DEFAULT * 100))
+        self.pet_size_slider.setAccessibleName("桌宠窗口大小")
+        self.pet_size_slider.setAccessibleDescription(
+            "可在百分之三十到百分之三百之间调整桌宠窗口与立绘的大小"
+        )
+        pet_row.addWidget(self.pet_size_slider, 1)
+
+        self.pet_size_value = QLabel(f"{self.pet_size_slider.value()}%")
+        self.pet_size_value.setObjectName("PetSizeValue")
+        self.pet_size_value.setMinimumWidth(52)
+        self.pet_size_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.pet_size_value.setAccessibleName("当前桌宠窗口大小")
+        pet_row.addWidget(self.pet_size_value)
+        layout.addLayout(pet_row)
+
+        pet_hint = QLabel(
+            "100% 为立绘原始大小；保存后桌宠立即按新比例缩放，"
+            "也可在桌宠右键菜单「显示与立绘 · 调整窗口大小…」里实时预览。"
+        )
+        pet_hint.setObjectName("HelperText")
+        pet_hint.setWordWrap(True)
+        layout.addWidget(pet_hint)
+
         self.reduced_motion_cb = QCheckBox("减少动画（气泡与输入框淡入淡出）")
         self.reduced_motion_cb.setObjectName("ReducedMotionToggle")
         self.reduced_motion_cb.setAccessibleName("减少动画")
@@ -360,12 +420,31 @@ class SetupWizard(QWidget):
         self.font_scale_slider.valueChanged.connect(
             self._on_font_scale_changed
         )
+        self.pet_size_slider.valueChanged.connect(
+            self._on_pet_size_changed
+        )
         return card
 
     def _on_font_scale_changed(self, value: int) -> None:
         value = int(value)
         self.font_scale_value.setText(f"{value}%")
         apply_ui_font_scale(self, value / 100.0)
+
+    def _on_pet_size_changed(self, value: int) -> None:
+        self.pet_size_value.setText(f"{int(value)}%")
+
+    def _fade_in(self) -> None:
+        """Gradually restore opacity so the window doesn't flash from transparent."""
+        try:
+            from PyQt5.QtCore import QPropertyAnimation
+            anim = QPropertyAnimation(self, b"windowOpacity")
+            anim.setDuration(180)
+            anim.setStartValue(self.windowOpacity())
+            anim.setEndValue(1.0)
+            anim.start()
+            self._fade_anim = anim  # keep a reference to prevent GC
+        except Exception:
+            self.setWindowOpacity(1.0)
 
     @property
     def is_dirty(self) -> bool:
@@ -556,13 +635,6 @@ class SetupWizard(QWidget):
         self.env_page.requirements_changed.connect(
             self._refresh_required_tabs
         )
-        for radio in (
-            self.llm_page.radio_ollama,
-            self.llm_page.radio_ds,
-            self.llm_page.radio_mimo,
-            self.llm_page.radio_custom,
-        ):
-            radio.toggled.connect(self._on_llm_backend_changed)
         self.backend_page.direct_radio.toggled.connect(
             self._on_conversation_mode_changed
         )
@@ -575,7 +647,7 @@ class SetupWizard(QWidget):
         self.llm_page.endpoint_input.textChanged.connect(
             self._refresh_required_tabs
         )
-        self.llm_page.model_input.textChanged.connect(
+        self.llm_page.model_combo.currentTextChanged.connect(
             self._refresh_required_tabs
         )
         self.llm_page.direct_api_key_input.textChanged.connect(
@@ -646,7 +718,10 @@ class SetupWizard(QWidget):
         issues[self.TAB_ENV].extend(self.env_page.required_missing())
 
         conversation_mode = self.backend_page.mode()
-        llm_backend = self.llm_page.get_backend()
+        from meapet.config.store import detect_endpoint_family
+
+        llm_endpoint = self.llm_page.endpoint_input.text().strip()
+        llm_family = detect_endpoint_family(llm_endpoint)
         llm_key = self.llm_page.direct_api_key_input.text().strip()
         if conversation_mode == "agent":
             if not self.backend_page.agent_base_url.text().strip():
@@ -662,14 +737,10 @@ class SetupWizard(QWidget):
                             "内网监听需 HTTPS 证书，或明确允许 HTTP"
                         )
         else:
-            if not self.llm_page.endpoint_input.text().strip():
+            if not llm_endpoint:
                 issues[self.TAB_CHAT].append("API 地址")
-            if not self.llm_page.model_input.text().strip():
+            if not self.llm_page.model_combo.currentText().strip():
                 issues[self.TAB_CHAT].append("模型 ID")
-            if llm_backend == "deepseek" and not llm_key:
-                issues[self.TAB_CHAT].append("DeepSeek API Key")
-            elif llm_backend == "mimo" and not llm_key:
-                issues[self.TAB_CHAT].append("MiMo API Key")
 
         if (
             self.tts_page.enable_cb.isChecked()
@@ -679,7 +750,7 @@ class SetupWizard(QWidget):
             if (
                 not tts_key
                 and conversation_mode == "direct"
-                and llm_backend == "mimo"
+                and llm_family == "mimo"
             ):
                 tts_key = llm_key
             if not tts_key:
@@ -695,7 +766,7 @@ class SetupWizard(QWidget):
                 if conversation_mode == "agent":
                     endpoint = self.backend_page.agent_base_url.text().strip()
                 else:
-                    endpoint = self.llm_page.endpoint_input.text().strip()
+                    endpoint = llm_endpoint
                 from meapet.utils import is_loopback_url
                 if (
                     endpoint
@@ -712,15 +783,15 @@ class SetupWizard(QWidget):
                 actual_backend = selected_backend
                 if selected_backend == "auto":
                     actual_backend = (
-                        llm_backend
-                        if llm_backend in {"ollama", "mimo"}
+                        llm_family
+                        if llm_family in {"ollama", "mimo"}
                         else "ollama"
                     )
                 if actual_backend == "mimo":
                     if not self.vision_page.allow_cloud_cb.isChecked():
                         issues[self.TAB_VISION].append("云端识图授权")
                     vision_key = self.vision_page.api_key_input.text().strip()
-                    if not vision_key and llm_backend == "mimo":
+                    if not vision_key and llm_family == "mimo":
                         vision_key = llm_key
                     if not vision_key:
                         issues[self.TAB_VISION].append("云端识图 API Key")
@@ -802,6 +873,12 @@ class SetupWizard(QWidget):
                     normalize_ui_font_scale(
                         display.get("font_scale", 1.0)
                     )
+                    * 100
+                )
+            )
+            self.pet_size_slider.setValue(
+                round(
+                    normalize_pet_size_factor(display.get("size_factor", 1.0))
                     * 100
                 )
             )
@@ -900,9 +977,12 @@ class SetupWizard(QWidget):
         return self._deep_merge(self._template_config(), existing)
 
     def _collect_display_fields(self, config: dict) -> None:
-        """显示页只负责它实际展示的两个选项。"""
+        """显示页只负责它实际展示的几个选项，其余 display 字段原样保留。"""
         display = config.setdefault("display", {})
         display["font_scale"] = self.font_scale_slider.value() / 100.0
+        display["size_factor"] = normalize_pet_size_factor(
+            self.pet_size_slider.value() / 100.0
+        )
         display["reduced_motion"] = self.reduced_motion_cb.isChecked()
 
     def _collect_reference_audios(
@@ -952,19 +1032,24 @@ class SetupWizard(QWidget):
 
         llm = config.get("llm") or {}
         direct = llm.get("direct") or {}
+        from meapet.config.store import detect_endpoint_family
+
         tts_key = self.tts_page.mimo_api_key_input.text().strip()
         tts_base = self.tts_page.mimo_api_base_input.text().strip()
-        if (
-            not tts_key
-            and llm.get("mode") == "direct"
-            and direct.get("provider") == "mimo"
-        ):
+        llm_is_mimo = (
+            llm.get("mode") == "direct"
+            and detect_endpoint_family(
+                direct.get("api_base"),
+                direct.get("host"),
+                llm.get("api_base"),
+                llm.get("host"),
+            )
+            == "mimo"
+        )
+        if not tts_key and llm_is_mimo:
             tts_key = str(direct.get("api_key") or "")
         if not tts_base:
-            if (
-                llm.get("mode") == "direct"
-                and direct.get("provider") == "mimo"
-            ):
+            if llm_is_mimo:
                 tts_base = str(direct.get("api_base") or "")
             tts_base = tts_base or "https://api.xiaomimimo.com/v1"
 
@@ -1036,8 +1121,10 @@ class SetupWizard(QWidget):
         llm["backend"] = (
             str(agent.get("kind") or "hermes")
             if mode == "agent"
-            else str(direct.get("provider") or "ollama")
+            else "custom"
         )
+        if mode == "direct":
+            direct["provider"] = "custom"
         # 兼容当前 ChatEngine；协议适配层完成后可逐步淡出这些镜像字段。
         llm["host"] = str(direct.get("host") or "")
         llm["api_base"] = str(direct.get("api_base") or "")

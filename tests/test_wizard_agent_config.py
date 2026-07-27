@@ -1,4 +1,4 @@
-"""配置中心的 direct/Agent 互斥配置与截图范围。"""
+"""配置中心的 direct/Agent 互斥配置与截图范围（OpenAI 兼容版）。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,7 +38,6 @@ class TestWizardConversationConfig(unittest.TestCase):
             initial_config=template,
         )
         self.wizard._load_timer.stop()
-        self.wizard.llm_page._status_timer.stop()
         self.wizard.env_page._check_timer.stop()
         for timer in self.wizard.tts_page._startup_timers:
             timer.stop()
@@ -47,13 +47,15 @@ class TestWizardConversationConfig(unittest.TestCase):
         self.wizard.deleteLater()
         QApplication.processEvents()
 
+    # ------------------------------------------------------------------
+    # direct 模式：保存实际协议、端点、模型与限额
+    # ------------------------------------------------------------------
     def test_direct_mode_saves_actual_protocol_endpoint_model_and_limits(self):
         page = self.wizard.llm_page
         self.wizard.backend_page.direct_radio.setChecked(True)
-        page.set_backend("deepseek")
-        page.set_protocol("openai_responses")
+        # 不再调用 set_backend；直接填写 endpoint
         page.endpoint_input.setText("https://models.example.test/v1")
-        page.model_input.setText("custom-reply-model")
+        page.model_combo.setEditText("custom-reply-model")
         page.temperature_input.setValue(0.35)
         page.max_tokens_input.setValue(2048)
         page.direct_api_key_input.setText("$CUSTOM_MODEL_KEY")
@@ -64,8 +66,8 @@ class TestWizardConversationConfig(unittest.TestCase):
         self.assertEqual(
             config["llm"]["direct"],
             {
-                "provider": "deepseek",
-                "protocol": "openai_responses",
+                "provider": "custom",
+                "protocol": "openai_chat",
                 "api_base": "https://models.example.test/v1",
                 "host": "",
                 "model": "custom-reply-model",
@@ -77,6 +79,9 @@ class TestWizardConversationConfig(unittest.TestCase):
         self.assertEqual(config["llm"]["api_base"], "https://models.example.test/v1")
         self.assertEqual(config["llm"]["model"], "custom-reply-model")
 
+    # ------------------------------------------------------------------
+    # collect 保留向导不拥有的字段
+    # ------------------------------------------------------------------
     def test_collect_preserves_fields_not_owned_by_the_wizard(self):
         self.wizard._existing_config = {
             "live2d": {
@@ -116,6 +121,8 @@ class TestWizardConversationConfig(unittest.TestCase):
             },
         }
         self.wizard.font_scale_slider.setValue(125)
+        # 窗口大小同字体缩放，由配置页控件决定，不再从旧配置透传。
+        self.wizard.pet_size_slider.setValue(140)
         self.wizard.reduced_motion_cb.setChecked(True)
 
         config = self.wizard.collect_config()
@@ -148,10 +155,13 @@ class TestWizardConversationConfig(unittest.TestCase):
             "keep-watcher",
         )
 
+    # ------------------------------------------------------------------
+    # Agent 校验继续流转到 TTS / Vision 页
+    # ------------------------------------------------------------------
     def test_agent_validation_continues_through_tts_and_vision(self):
         backend = self.wizard.backend_page
         backend.agent_radio.setChecked(True)
-        backend.agent_base_url.setText("https://agent.example.test")
+        backend.agent_base_url.setText("https://agent.example.test/v1")
         self.wizard.tts_page.enable_cb.setChecked(True)
         self.wizard.tts_page.set_engine("mimo")
         self.wizard.tts_page.mimo_api_key_input.clear()
@@ -167,10 +177,12 @@ class TestWizardConversationConfig(unittest.TestCase):
             issues[self.wizard.TAB_VISION],
         )
 
+    # ------------------------------------------------------------------
+    # direct api_key 只有一个可编辑来源
+    # ------------------------------------------------------------------
     def test_direct_api_key_has_one_editable_source(self):
         page = self.wizard.llm_page
         self.wizard.backend_page.direct_radio.setChecked(True)
-        page.set_backend("deepseek")
         page.direct_api_key_input.setText("single-source-key")
 
         config = self.wizard.collect_config()
@@ -181,35 +193,79 @@ class TestWizardConversationConfig(unittest.TestCase):
         )
         self.assertEqual(config["llm"]["api_key"], "single-source-key")
 
-    def test_provider_switch_restores_each_provider_draft(self):
+    # ------------------------------------------------------------------
+    # get_backend 始终返回 custom，不修改 UI 字段
+    # ------------------------------------------------------------------
+    def test_get_backend_always_returns_custom(self):
+        """Unified form: get_backend() always returns 'custom'."""
         page = self.wizard.llm_page
-        page.set_backend("deepseek")
-        page.endpoint_input.setText("https://private.deepseek.test/v1")
-        page.model_input.setText("private-deepseek-model")
-        page.direct_api_key_input.setText("deepseek-draft-key")
+        page.endpoint_input.setText("https://custom.endpoint/v1")
+        page.model_combo.setEditText("custom-model")
+        page.direct_api_key_input.setText("custom-key")
 
-        page.set_backend("mimo")
-        self.assertEqual(page.endpoint_input.text(), "https://api.xiaomimimo.com/v1")
-        self.assertEqual(page.model_input.text(), "mimo-v2.5")
-        self.assertEqual(page.direct_api_key_input.text(), "")
+        self.assertEqual(page.get_backend(), "custom")
+        # UI 字段不应被修改
+        self.assertEqual(page.endpoint_input.text(), "https://custom.endpoint/v1")
+        self.assertEqual(page.model_combo.currentText(), "custom-model")
+        self.assertEqual(page.direct_api_key_input.text(), "custom-key")
 
-        page.endpoint_input.setText("https://private.mimo.test/v1")
-        page.direct_api_key_input.setText("mimo-draft-key")
-        page.set_backend("deepseek")
-
-        self.assertEqual(
-            page.endpoint_input.text(),
-            "https://private.deepseek.test/v1",
+    # ------------------------------------------------------------------
+    # 恢复 profile 不应覆盖已编辑的 endpoint
+    # ------------------------------------------------------------------
+    def test_restored_profile_does_not_override_an_edited_endpoint(self):
+        page = self.wizard.llm_page
+        self.wizard.backend_page.direct_radio.setChecked(True)
+        page.apply_direct_profile(
+            {
+                "provider": "custom",
+                "api_base": "http://127.0.0.1:11434/v1",
+                "model": "qwen",
+            }
         )
-        self.assertEqual(page.model_input.text(), "private-deepseek-model")
-        self.assertEqual(page.direct_api_key_input.text(), "deepseek-draft-key")
 
+        page.endpoint_input.setText("https://api.deepseek.com/v1")
+
+        config = self.wizard.collect_config()
+        self.assertEqual(config["llm"]["direct"]["provider"], "custom")
+        self.assertEqual(
+            config["llm"]["direct"]["api_base"],
+            "https://api.deepseek.com/v1",
+        )
+
+    # ------------------------------------------------------------------
+    # 编辑 endpoint 后 provider 仍为 custom
+    # ------------------------------------------------------------------
+    def test_editing_endpoint_keeps_custom_provider(self):
+        page = self.wizard.llm_page
+        page.endpoint_input.setText("https://api.deepseek.com/v1")
+
+        self.assertEqual(page.get_backend(), "custom")
+        # 下拉首项是「自动识别 / 自定义」，其后是供应商预设；
+        # 无论选哪个，保存的 provider 身份都仍是 custom。
+        values = [
+            page.provider_combo.itemData(i)
+            for i in range(page.provider_combo.count())
+        ]
+        self.assertEqual(values[0], "")
+        self.assertGreater(len(values), 1)
+        self.assertIn("deepseek", values)
+        self.assertTrue(page.provider_combo.isEnabled())
+        self.assertEqual(page.collect_direct_profile()["provider"], "custom")
+        # Ollama 地址仍保存 custom，但协议自动识别为 ollama_chat
+        page.endpoint_input.setText("http://127.0.0.1:11434")
+        profile = page.collect_direct_profile()
+        self.assertEqual(profile["provider"], "custom")
+        self.assertEqual(profile["protocol"], "ollama_chat")
+
+    # ------------------------------------------------------------------
+    # Agent 模式：保存 OpenAI 兼容配置 + 控制监听
+    # ------------------------------------------------------------------
     def test_agent_mode_preserves_direct_profile_and_collects_control_listener(self):
         self.wizard._existing_config = {
             "llm": {
                 "mode": "direct",
                 "direct": {
-                    "provider": "mimo",
+                    "provider": "custom",
                     "protocol": "openai_chat",
                     "api_base": "https://saved.example/v1",
                     "host": "",
@@ -222,11 +278,9 @@ class TestWizardConversationConfig(unittest.TestCase):
         }
         page = self.wizard.backend_page
         page.agent_radio.setChecked(True)
-        page.set_agent_kind("hermes")
-        page.agent_base_url.setText("http://192.168.50.20:8642")
-        page.agent_auth_token.setText("$HERMES_API_SERVER_KEY")
-        page.agent_session_id.setText("session-a")
-        page.agent_session_key.setText("memory-a")
+        # agent 段统一为 OpenAI 兼容
+        page.agent_base_url.setText("https://agent.example.test/v1")
+        page.agent_auth_token.setText("$OPENAI_API_KEY")
         page.agent_history_turns.setValue(5)
         page.timeline_turns.setValue(9)
         page.control_enabled.setChecked(True)
@@ -239,12 +293,11 @@ class TestWizardConversationConfig(unittest.TestCase):
         config = self.wizard.collect_config()
 
         self.assertEqual(config["llm"]["mode"], "agent")
-        self.assertEqual(config["llm"]["agent"]["kind"], "hermes")
-        self.assertEqual(
-            config["llm"]["agent"]["base_url"],
-            "http://192.168.50.20:8642",
-        )
-        self.assertEqual(config["llm"]["agent"]["history_turns"], 5)
+        agent = config["llm"]["agent"]
+        self.assertEqual(agent["base_url"], "https://agent.example.test/v1")
+        self.assertEqual(agent["auth_token"], "$OPENAI_API_KEY")
+        self.assertEqual(agent["history_turns"], 5)
+        
         self.assertEqual(config["ui"]["timeline_turns"], 9)
         self.assertEqual(config["llm"]["direct"]["model"], "saved-model")
         self.assertEqual(
@@ -261,16 +314,17 @@ class TestWizardConversationConfig(unittest.TestCase):
                 "ca_file": "",
             },
         )
-        self.assertTrue(page.insecure_http_warning.isVisibleTo(page))
 
+    # ------------------------------------------------------------------
+    # 加载 Agent 配置恢复模式，不覆盖未激活的 direct
+    # ------------------------------------------------------------------
     def test_loading_agent_config_restores_mode_without_overwriting_inactive_direct(self):
         config = {
             "llm": {
                 "mode": "agent",
-                "backend": "hermes",
                 "direct": {
-                    "provider": "ollama",
-                    "protocol": "ollama_chat",
+                    "provider": "custom",
+                    "protocol": "openai_chat",
                     "api_base": "",
                     "host": "http://10.0.0.2:11434",
                     "model": "local-model",
@@ -279,12 +333,13 @@ class TestWizardConversationConfig(unittest.TestCase):
                     "max_tokens": 700,
                 },
                 "agent": {
-                    "kind": "hermes",
-                    "base_url": "https://agent.example.test",
-                    "auth_token": "$HERMES_API_SERVER_KEY",
-                    "session_id": "resume-me",
-                    "session_key": "memory-me",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "model": "gpt-4o-mini",
+                    "temperature": 0.7,
+                    "max_tokens": 4096,
                     "history_turns": 7,
+                    "timeout_seconds": 120,
                     "tls": {"verify": True, "ca_file": "agent-ca.pem"},
                 },
             },
@@ -306,31 +361,15 @@ class TestWizardConversationConfig(unittest.TestCase):
         collected = self.wizard.collect_config()
 
         self.assertTrue(self.wizard.backend_page.agent_radio.isChecked())
-        self.assertEqual(collected["llm"]["agent"]["session_id"], "resume-me")
+        self.assertEqual(collected["llm"]["agent"]["model"], "gpt-4o-mini")
         self.assertEqual(collected["llm"]["direct"]["model"], "local-model")
         self.assertEqual(collected["agent_control"]["port"], 9000)
         self.assertEqual(self.wizard.backend_page.timeline_turns.value(), 7)
         self.assertEqual(collected["ui"]["timeline_turns"], 7)
 
-    def test_openclaw_remote_plaintext_ws_requires_explicit_visible_opt_in(self):
-        page = self.wizard.backend_page
-        page.agent_radio.setChecked(True)
-        page.set_agent_kind("openclaw")
-        page.agent_base_url.setText("ws://192.168.50.20:18789")
-        page.agent_auth_token.setText("$OPENCLAW_GATEWAY_TOKEN")
-
-        self.assertFalse(page.agent_allow_insecure_ws.isChecked())
-        self.assertFalse(page.insecure_ws_warning.isVisibleTo(page))
-
-        page.agent_allow_insecure_ws.setChecked(True)
-        config = self.wizard.collect_config()
-
-        self.assertTrue(config["llm"]["agent"]["allow_insecure_ws"])
-        self.assertTrue(page.insecure_ws_warning.isVisibleTo(page))
-
-        self.wizard.apply_conversation_config(config)
-        self.assertTrue(page.agent_allow_insecure_ws.isChecked())
-
+    # ------------------------------------------------------------------
+    # 控制 token 可显示、复制、重新生成
+    # ------------------------------------------------------------------
     def test_control_token_can_be_revealed_copied_and_regenerated_before_save(self):
         from PyQt5.QtWidgets import QLineEdit
 
@@ -350,14 +389,18 @@ class TestWizardConversationConfig(unittest.TestCase):
         self.assertNotEqual(regenerated, "old-control-token-value-long-enough")
         self.assertGreaterEqual(len(regenerated), 43)
 
+    # ------------------------------------------------------------------
+    # 保存时发出归一化后的配置
+    # ------------------------------------------------------------------
     def test_saving_emits_normalized_config_for_the_running_desktop(self):
         spy = QSignalSpy(self.wizard.config_saved)
         payload = {
             "llm": {
                 "mode": "agent",
                 "agent": {
-                    "kind": "hermes",
-                    "base_url": "http://127.0.0.1:8642",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "model": "gpt-4o-mini",
                 },
             }
         }
@@ -383,7 +426,13 @@ class TestWizardConversationConfig(unittest.TestCase):
         emitted = spy[0][0]
         self.assertEqual(emitted["llm"]["mode"], "agent")
         self.assertIn("direct", emitted["llm"])
+        agent = emitted["llm"]["agent"]
+        self.assertEqual(agent["base_url"], "https://api.openai.com/v1")
+        self.assertEqual(agent["model"], "gpt-4o-mini")
 
+    # ------------------------------------------------------------------
+    # 配置不完整时要求显式确认才能保存
+    # ------------------------------------------------------------------
     def test_incomplete_configuration_requires_explicit_save_confirmation(self):
         self.wizard.backend_page.agent_radio.setChecked(True)
         self.wizard.backend_page.agent_base_url.clear()
@@ -401,6 +450,9 @@ class TestWizardConversationConfig(unittest.TestCase):
         question.assert_called_once()
         save.assert_not_called()
 
+    # ------------------------------------------------------------------
+    # 自定义配置路径：加载并用于保存
+    # ------------------------------------------------------------------
     def test_custom_config_path_is_loaded_and_used_for_save(self):
         from wizard.app import SetupWizard
 
@@ -418,7 +470,6 @@ class TestWizardConversationConfig(unittest.TestCase):
             wizard = SetupWizard(config_path=str(path))
             self.addCleanup(wizard.deleteLater)
             wizard._load_timer.stop()
-            wizard.llm_page._status_timer.stop()
             wizard.env_page._check_timer.stop()
             for timer in wizard.tts_page._startup_timers:
                 timer.stop()
@@ -426,7 +477,7 @@ class TestWizardConversationConfig(unittest.TestCase):
 
             self.assertEqual(wizard.config_path, str(path))
             self.assertEqual(wizard.font_scale_slider.value(), 130)
-            self.assertEqual(wizard.llm_page.model_input.text(), "profile-model")
+            self.assertEqual(wizard.llm_page.model_combo.currentText(), "profile-model")
 
             with (
                 unittest.mock.patch("meapet.config.store.save_config") as save,
@@ -436,6 +487,9 @@ class TestWizardConversationConfig(unittest.TestCase):
 
             self.assertEqual(save.call_args.args[1], str(path))
 
+    # ------------------------------------------------------------------
+    # 保存时合并磁盘上未被 UI 覆盖的字段
+    # ------------------------------------------------------------------
     def test_save_uses_latest_disk_values_for_fields_outside_the_ui(self):
         from wizard.app import SetupWizard
 
@@ -443,9 +497,8 @@ class TestWizardConversationConfig(unittest.TestCase):
             path = Path(td) / "profile.json"
             path.write_text(
                 '{"plugin_config":{"revision":1},'
-                '"llm":{"mode":"direct","backend":"ollama",'
-                '"direct":{"provider":"ollama",'
-                '"protocol":"ollama_chat",'
+                '"llm":{"mode":"direct","backend":"custom",'
+                '"direct":{"provider":"custom","protocol":"openai_chat",'
                 '"host":"http://127.0.0.1:11434",'
                 '"api_base":"","model":"qwen3.5:4b",'
                 '"api_key":"","temperature":0.7,"max_tokens":512}},'
@@ -455,7 +508,6 @@ class TestWizardConversationConfig(unittest.TestCase):
             wizard = SetupWizard(config_path=str(path))
             self.addCleanup(wizard.deleteLater)
             wizard._load_timer.stop()
-            wizard.llm_page._status_timer.stop()
             wizard.env_page._check_timer.stop()
             for timer in wizard.tts_page._startup_timers:
                 timer.stop()
@@ -464,9 +516,8 @@ class TestWizardConversationConfig(unittest.TestCase):
             path.write_text(
                 '{"plugin_config":{"revision":2,"external":true},'
                 '"live2d":{"enabled":false,"scale":0.41},'
-                '"llm":{"mode":"direct","backend":"ollama",'
-                '"direct":{"provider":"ollama",'
-                '"protocol":"ollama_chat",'
+                '"llm":{"mode":"direct","backend":"custom",'
+                '"direct":{"provider":"custom","protocol":"openai_chat",'
                 '"host":"http://127.0.0.1:11434",'
                 '"api_base":"","model":"qwen3.5:4b",'
                 '"api_key":"","temperature":0.7,"max_tokens":512}},'
@@ -493,11 +544,14 @@ class TestWizardConversationConfig(unittest.TestCase):
             self.assertFalse(saved["live2d"]["enabled"])
             self.assertEqual(saved["live2d"]["scale"], 0.41)
 
+    # ------------------------------------------------------------------
+    # 脏窗口关闭前需确认
+    # ------------------------------------------------------------------
     def test_dirty_window_confirms_before_discarding_changes(self):
         self.wizard.show()
         QApplication.processEvents()
         self.assertFalse(self.wizard.is_dirty)
-        self.wizard.llm_page.model_input.setText("unsaved-model")
+        self.wizard.llm_page.model_combo.setEditText("unsaved-model")
         self.assertTrue(self.wizard.is_dirty)
         event = SimpleNamespace(
             accept=unittest.mock.Mock(),
@@ -515,6 +569,9 @@ class TestWizardConversationConfig(unittest.TestCase):
         event.accept.assert_not_called()
         self.wizard._dirty = False
 
+    # ------------------------------------------------------------------
+    # 必需环境变量缺失时标记环境标签页
+    # ------------------------------------------------------------------
     def test_required_environment_failure_marks_environment_tab(self):
         required = next(
             name
@@ -534,6 +591,9 @@ class TestWizardConversationConfig(unittest.TestCase):
             self.wizard.tabs.tabIcon(self.wizard.TAB_ENV).isNull()
         )
 
+    # ------------------------------------------------------------------
+    # 显示页文案区分实时与重启设置
+    # ------------------------------------------------------------------
     def test_display_copy_distinguishes_live_and_restart_settings(self):
         copy = " ".join(
             label.text()
@@ -542,6 +602,9 @@ class TestWizardConversationConfig(unittest.TestCase):
         self.assertIn("桌宠重启后应用", copy)
         self.assertIn("减少动画保存后立即应用", copy)
 
+    # ------------------------------------------------------------------
+    # 桌面端打开向导时传入当前配置路径与值
+    # ------------------------------------------------------------------
     def test_desktop_opens_wizard_with_active_config_path_and_values(self):
         from meapet.desktop.window_chrome import PetWindowChromeMixin
 
@@ -578,7 +641,7 @@ class TestWizardCaptureScope(unittest.TestCase):
 
         page = VisionPage()
         self.addCleanup(page.deleteLater)
-        watcher = page.collect("ollama", {})["watcher"]
+        watcher = page.collect("custom", {})["watcher"]
         self.assertNotIn("capture", watcher)
         self.assertFalse(hasattr(page, "capture_scope_combo"))
 
@@ -636,3 +699,4 @@ class TestWizardCaptureScope(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

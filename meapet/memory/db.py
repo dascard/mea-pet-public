@@ -17,9 +17,9 @@ from meapet.log import get_color_logger
 
 log = get_color_logger("memory")
 
-from meapet.paths import project_path
+from meapet.paths import data_path
 
-DB_PATH = project_path("mea_memory.db")
+DB_PATH = data_path("mea_memory.db")
 SCHEMA_VERSION = 5  # v5: jieba 词级 embedding 替代 trigram hash
 VECTOR_DIM = 2048   # 词级 hash 空间更大减少碰撞
 MAX_MEMORIES = 2000 # 记忆总量软上限
@@ -156,11 +156,12 @@ class MeaMemory:
             pass
         self._lock = threading.RLock()
         self._emb_cache: Dict[int, List[Tuple[int, float]]] = {}
+        # 启动时不预热全量 embedding，避免 MeaPet.__init__ 在 app.exec_ 前
+        # 同步扫表导致首帧“未响应”。首次检索/维护时再加载。
+        self._emb_cache_loaded = False
         self._init_tables()
         self._migrate_schema()
         self._ensure_defaults()
-        self._load_emb_cache()
-        log.debug(f"[DB] 嵌入缓存已加载 ({len(self._emb_cache)} 条)")
 
     # ── 私有：加锁执行 ──
     def _write(self, func, *args, **kwargs):
@@ -168,8 +169,19 @@ class MeaMemory:
             return func(*args, **kwargs)
 
     # ── 嵌入缓存 ──
+    def _ensure_emb_cache(self) -> None:
+        """惰性加载 embedding 缓存（幂等，可在锁内外调用）。"""
+        if self._emb_cache_loaded:
+            return
+        with self._lock:
+            if self._emb_cache_loaded:
+                return
+            count = self._load_emb_cache()
+            self._emb_cache_loaded = True
+            log.debug(f"[DB] 嵌入缓存已加载 ({count} 条)")
+
     def _load_emb_cache(self):
-        """从数据库加载全部 embedding 到内存缓存。"""
+        """从数据库加载全部 embedding 到内存缓存。调用方需持锁或接受竞态窗口。"""
         with self._lock:
             c = self.conn.cursor()
             c.execute("SELECT id, embedding FROM memories")
@@ -951,6 +963,7 @@ class MeaMemory:
         tags: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         t0 = time.perf_counter()
+        self._ensure_emb_cache()
         query_emb = _compute_embedding(query)
         conditions = []
         params = []
@@ -982,7 +995,9 @@ class MeaMemory:
             self._mark_recalled(top)
             elapsed = (time.perf_counter() - t0) * 1000
             log.debug(f"[SRCH] query={query!r} → 无嵌入, 纯重要度排序 {len(top)}条/共{total_candidates} ({elapsed:.1f}ms)")
-            return top
+            # 统一经 _row_to_memory_dict：tags/metadata/source_ids 必须是解析后的对象，
+            # 否则调用方按列表拼接时会把 JSON 字符串拆成单字符。
+            return [self._row_to_memory_dict(r) for r in top]
 
         scored = []
         for r in rows:
@@ -1010,7 +1025,8 @@ class MeaMemory:
         min_sim = scored[-1][1] if scored else 0.0
         log.debug(f"[SRCH] query={query!r} → {len(result)}条/共{total_candidates}候选 "
                   f"sim范围=[{min_sim:.3f},{max_sim:.3f}] query_emb_dims={len(query_emb)} ({elapsed:.1f}ms)")
-        return result
+        # 同上：返回前解析 JSON 字段，保证 tags 等按列表语义交给上层
+        return [self._row_to_memory_dict(r) for r in result]
 
     def _mark_recalled(self, memories: List[Dict[str, Any]]):
         if not memories:
@@ -1055,9 +1071,14 @@ class MeaMemory:
             )
             ids = [r["id"] for r in c.fetchall()]
             if not ids:
-                # 重要度裁剪不够，直接按 last_recalled 裁
+                # 重要度裁剪不够，直接按 last_recalled 裁。
+                # 此处无 importance 前置条件，type_expr 的 "AND ..." 不能直接拼，
+                # 否则得到 "FROM memories AND ..." 的语法错，需改用独立 WHERE。
+                where_expr = ""
+                if avoid_type:
+                    where_expr = f"WHERE memory_type NOT IN ({placeholders})"
                 c.execute(
-                    f"SELECT id FROM memories {type_expr if avoid_type else ''} "
+                    f"SELECT id FROM memories {where_expr} "
                     f"ORDER BY last_recalled ASC, id ASC LIMIT ?",
                     params + [excess],
                 )
@@ -1078,6 +1099,7 @@ class MeaMemory:
         t0 = time.perf_counter()
         now = time.time()
         log.debug("[LIFY] 开始生命周期维护")
+        self._ensure_emb_cache()
 
         # 1. 重要性衰减（幂等：用 last_decay 做衰减检查点，避免重复衰减）
         decay_count = 0
@@ -1571,5 +1593,6 @@ class MeaMemory:
             c.execute("DELETE FROM conversation_turns")
             self.conn.commit()
             self._emb_cache.clear()
+            self._emb_cache_loaded = True
         self._ensure_defaults()
         log.debug("[DB] 所有数据已重置，缓存已清空")

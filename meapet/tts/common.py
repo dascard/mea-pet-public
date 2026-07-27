@@ -1,9 +1,68 @@
-"""TTS 共享工具与常量（供 tts.py 与引擎 mixin 使用）"""
+"""TTS shared utilities and constants (used by tts.py and engine mixins)."""
+from __future__ import annotations
+
 import os
 import subprocess
+import sys
 from meapet.log import get_color_logger
 
 log = get_color_logger("tts")
+
+
+def _is_frozen() -> bool:
+    """Check if running in a PyInstaller-frozen environment."""
+    try:
+        from meapet.paths import is_frozen
+
+        return is_frozen()
+    except Exception:
+        return bool(getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"))
+
+
+def is_pet_executable(path: str | None) -> bool:
+    """True when *path* is the frozen MeaPet launcher (not a real Python)."""
+    if not path:
+        return False
+    try:
+        if not _is_frozen():
+            return False
+        return os.path.realpath(path) == os.path.realpath(sys.executable)
+    except Exception:
+        return False
+
+
+def resolve_external_python(path: str | None) -> str:
+    """Return *path* only when it is a real on-disk interpreter, else ``\"\"``."""
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    if is_pet_executable(raw):
+        return ""
+    if not os.path.isfile(raw):
+        return ""
+    return raw
+
+
+def hidden_subprocess_kwargs() -> dict:
+    """Kwargs so Windows console Python does not flash a black terminal window.
+
+    Prefer ``CREATE_NO_WINDOW`` (Win 3.7+). Also set STARTUPINFO as a belt-and-
+    suspenders for older hosts. No-op on non-Windows.
+    """
+    if os.name != "nt":
+        return {}
+    kwargs: dict = {}
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if create_no_window:
+        kwargs["creationflags"] = create_no_window
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kwargs
 
 
 _LFS_POINTER_HEADER = b"version https://git-lfs.github.com/spec/v1"
@@ -77,11 +136,23 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 
 
 def _has_module(py_exe: str, module_name: str) -> bool:
-    """检查指定 Python 能否 import 某模块"""
+    """Check whether a given Python can import *module_name*.
+
+    In frozen mode (PyInstaller), ``sys.executable`` is the pet exe, not a
+    real Python interpreter — running it as a subprocess would spawn a new
+    MeaPet instance.  Return False immediately in that case.
+    """
+    if _is_frozen():
+        log.warning(
+            "[frozen] Skipping module check for %r — "
+            "sys.executable is the pet exe, not a Python interpreter.",
+            module_name,
+        )
+        return False
     try:
         r = subprocess.run(
             [py_exe, "-c", f"import {module_name}; print('ok')"],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=15,
         )
         return r.returncode == 0 and 'ok' in r.stdout
     except Exception:
@@ -90,7 +161,18 @@ def _has_module(py_exe: str, module_name: str) -> bool:
 
 def _install_modules(py_exe: str, packages: list[str],
                      extra_index: str = None) -> bool:
-    """pip install 包列表到指定 Python，返回是否全部成功"""
+    """``pip install`` *packages* into *py_exe*.
+
+    Returns True only when every package installed successfully.
+    In frozen mode this always returns False — ``sys.executable`` is the
+    pet exe and cannot run pip.
+    """
+    if _is_frozen():
+        log.warning(
+            "[frozen] Cannot pip install — sys.executable is the pet exe. "
+            "Install dependencies manually, or use MiMo cloud TTS."
+        )
+        return False
     cmd = [py_exe, "-m", "pip", "install", "--timeout", "120"]
     if extra_index:
         # 有专用 index（如 PyTorch）时用它做主源，清华做备用
@@ -113,10 +195,20 @@ def _install_modules(py_exe: str, packages: list[str],
 
 
 def auto_install_gsv_deps(py_exe: str, allow_download: bool = False) -> bool:
-    """检查 GSV 依赖；仅当 allow_download=True 时才 pip 安装（默认不自动下载）"""
-    log.info(f"检查 GSV 依赖 (Python: {py_exe})")
+    """Check GSV dependencies; pip-installs only when *allow_download* is True.
 
-    # 快速检查缺了哪些
+    In frozen mode all subprocess operations are skipped — ``sys.executable``
+    is the pet exe, not a Python interpreter.  Returns False immediately.
+    """
+    if _is_frozen():
+        log.warning(
+            "[frozen] GSV deps cannot be auto-installed. "
+            "Use MiMo cloud TTS or install a real Python runtime separately."
+        )
+        return False
+    log.info(f"Checking GSV deps (Python: {py_exe})")
+
+    # Quickly scan which packages are missing.
     missing = []
     for pkg in GSV_REQUIRED_PACKAGES:
         mod = _get_import_name(pkg)

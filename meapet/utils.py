@@ -47,9 +47,10 @@ def safe_print(*args, **kwargs):
 def log_error(context: str, message: str, log_dir: str = None):
     """仅在有错误时写入日志，避免无意义的磁盘 I/O；内容脱敏"""
     if log_dir is None:
-        from meapet.paths import project_root
-        log_dir = project_root()
+        from meapet.paths import get_data_dir
+        log_dir = get_data_dir()
     try:
+        os.makedirs(log_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(os.path.join(log_dir, "chat_errors.log"), "a", encoding="utf-8") as f:
             f.write(f"[{ts}] [{context}] {redact_text(str(message))}\n")
@@ -265,30 +266,3 @@ def cleanup_audio_cache(
     except Exception:
         pass
     return {"removed": removed, "kept": kept}
-
-
-def enable_vt():
-    """开启 stdout 和 stderr 的 VT 转译支持"""
-    if sys.platform != 'win32':
-        return True
-
-    kernel32 = ctypes.windll.kernel32
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-
-    # logging 默认输出到 stderr(-12)，但也可能配置为 stdout(-11)
-    # 必须同时开启两个流的 VT 支持
-    handles = [-11, -12]
-    success_count = 0
-
-    for handle_id in handles:
-        try:
-            handle = kernel32.GetStdHandle(handle_id)
-            mode = ctypes.c_ulong()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                if kernel32.SetConsoleMode(handle, new_mode):
-                    success_count += 1
-        except Exception:
-            pass
-
-    return success_count > 0

@@ -11,7 +11,7 @@ import socket  # must import before PyQt (QtNetwork hook)
 # 在所有导入之前开启终端 VT 转译支持
 # 确保后续的 get_color_logger 和 logging 模块能正确输出彩色日志
 try:
-    from meapet.utils import enable_vt
+    from meapet.log import enable_vt
     enable_vt()
 except Exception:
     pass
@@ -27,6 +27,7 @@ from typing import Optional
 
 from PyQt5.QtWidgets import QApplication, QWidget
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QSurfaceFormat
 
 from meapet.utils import (
     safe_print,
@@ -41,7 +42,6 @@ from meapet.config.store import (
     resolve_vision_api_base,
     resolve_vision_api_key,
     resolve_vision_backend,
-    resolve_vision_host,
 )
 from meapet.config.checker import check_config_lines
 
@@ -144,6 +144,14 @@ class MeaPet(
         self._drag_move_timer.timeout.connect(self._flush_drag_position)
         self._standby = False
         self._standby_bubble = None
+        # Standby click-through (native pass-through + right-click poll).
+        from meapet.desktop.click_through import ClickThroughState, RightClickEdgeDetector
+
+        self._click_through_state = ClickThroughState()
+        self._standby_rc_timer = None
+        self._standby_rc_detector = RightClickEdgeDetector()
+        self._standby_menu_open = False
+        self._qt_transparent_for_input = False
 
         self._init_window()
 
@@ -165,6 +173,7 @@ class MeaPet(
         _safe("tray", self._setup_tray)
         _safe("interaction", self._init_interaction)
         _safe("timers", self._init_timers)
+        _safe("screen", self._init_screen_guard)
 
         try:
             self._place_bottom_right()
@@ -178,7 +187,8 @@ class MeaPet(
             log.warning(f"[init] 碰撞区域设置失败: {e}")
 
         try:
-            cache_dir = str(PROJECT_ROOT / "audio_cache")
+            from meapet.paths import data_path
+            cache_dir = data_path("audio_cache")
             stats = cleanup_audio_cache(cache_dir, max_files=40, max_age_hours=48.0)
             if stats.get("removed"):
                 log.info(
@@ -282,7 +292,7 @@ class MeaPet(
         else:
             self.agent_adapter = None
             self.chat_engine = create_engine_from_config(self.config, self.memory)
-            if self.chat_engine.backend == "ollama" and self.chat_engine.available:
+            if self.chat_engine.available:
                 QTimer.singleShot(2000, self._show_warmup_status)
         conversation_key = self._refresh_conversation_key()
         if mode == "agent":
@@ -369,52 +379,29 @@ class MeaPet(
         vision_cfg = self.config.get("vision", {}) or {}
         vision_mode = str(vision_cfg.get("mode") or "disabled").strip().lower()
 
-        backend = resolve_vision_backend(vision_cfg, llm_cfg)
-        vision_model = vision_cfg.get("model") or (
-            "mimo" if backend == "mimo" else "qwen3.5:4b"
-        )
-        if backend == "mimo":
-            mimo_model = (
-                vision_cfg.get("model")
-                if vision_cfg.get("model")
-                and vision_cfg.get("model") not in ("mimo", "qwen3.5:4b")
-                else llm_cfg.get("model", "mimo-v2.5")
-            )
-            if not mimo_model or mimo_model in ("mimo", "qwen3.5:4b"):
-                mimo_model = llm_cfg.get("model", "mimo-v2.5")
-        else:
-            mimo_model = llm_cfg.get("model", "mimo-v2.5")
-
         api_key = resolve_vision_api_key(vision_cfg, llm_cfg)
+        backend = resolve_vision_backend(vision_cfg, llm_cfg)
+        # 上传目标与云端确认共用同一解析：ollama 只走 host，mimo 走 api_base
         api_base = resolve_vision_api_base(vision_cfg, llm_cfg)
-        if backend == "mimo":
-            try:
-                from meapet.config.store import normalize_mimo_model_id
-                mimo_model = normalize_mimo_model_id(mimo_model, for_vision=True)
-            except Exception:
-                if not mimo_model or mimo_model in ("mimo", "qwen3.5:4b") or str(mimo_model).startswith("XiaomiMiMo/"):
-                    mimo_model = "mimo-v2.5"
-        ollama_host = resolve_vision_host(vision_cfg, llm_cfg)
+        vision_model = vision_cfg.get("model") or "qwen3.5:4b"
 
         log.info(
             f"[watcher] 视觉路由: mode={vision_mode} backend={backend} "
-            f"model={vision_model if backend != 'mimo' else mimo_model} "
+            f"model={vision_model} "
             f"allow_cloud={self.config.get('watcher', {}).get('allow_cloud', False)}"
         )
         self._watcher = ScreenWatcher(
-            ollama_host=ollama_host,
-            vision_model=vision_model if backend != "mimo" else mimo_model,
-            chat_model=vision_model if backend != "mimo" else mimo_model,
-            backend=backend,
             api_base=api_base,
+            vision_model=vision_model,
+            chat_model=vision_model,
             api_key=api_key,
-            mimo_model=mimo_model,
+            backend=backend,
             mode=vision_mode,
-            # watcher 截图范围由每次五秒授权框决定；初始始终为全屏。
             capture_scope="full_screen",
             capture_region=None,
             capture_application="",
         )
+
         self._watcher.result_ready.connect(self._on_watch_result)
         self._watcher.error.connect(self._on_watch_error)
         self._watcher.silent.connect(self._on_watch_silent)
@@ -442,6 +429,9 @@ class MeaPet(
 
     # ── mouse ──────────────────────────────────────────
     def mousePressEvent(self, event):
+        # 待机：左键等交互全部忽略（穿透由原生后端负责；右键走轮询菜单）。
+        if getattr(self, "_standby", False):
+            return
         if event.button() == Qt.LeftButton:
             head_threshold = int(self.height() * 0.35)
             self._is_head_touching = event.y() < head_threshold
@@ -451,6 +441,8 @@ class MeaPet(
             self._drag_window_origin = self.pos()
 
     def mouseMoveEvent(self, event):
+        if getattr(self, "_standby", False):
+            return
         if not (self._dragging and event.buttons() & Qt.LeftButton):
             return
         if self._is_head_touching and self._head_press_x is not None:
@@ -485,6 +477,13 @@ class MeaPet(
         self._position_bubble()
 
     def mouseReleaseEvent(self, event):
+        if getattr(self, "_standby", False):
+            self._dragging = False
+            self._drag_pointer_origin = None
+            self._drag_window_origin = None
+            self._is_head_touching = False
+            self._head_press_x = None
+            return
         self._drag_move_timer.stop()
         self._flush_drag_position()
         self._dragging = False
@@ -494,6 +493,8 @@ class MeaPet(
         self._head_press_x = None
 
     def mouseDoubleClickEvent(self, event):
+        if getattr(self, "_standby", False):
+            return
         self._start_chat()
 
     def showEvent(self, event):
@@ -501,6 +502,11 @@ class MeaPet(
         super().showEvent(event)
         if hasattr(self, '_idle_timer') and self._idle_timer and not self._idle_timer.isActive():
             self._idle_timer.start(20000)
+        # 待机穿透可能因 hide/show 或 HWND 重建失效，显示时重新确保。
+        if getattr(self, "_standby", False) and not getattr(self, "_standby_menu_open", False):
+            ensure = getattr(self, "_ensure_standby_click_through", None)
+            if callable(ensure):
+                ensure()
 
     def closeEvent(self, event):
         # 桌宠是常驻悬浮窗：系统/误触关闭只隐藏，真正退出走右键「退出」
@@ -545,17 +551,19 @@ def main():
     from datetime import datetime
     from pathlib import Path as _Path
 
-    # 原生崩溃落盘（OpenGL / Live2D C++）
+    # Native crash log (OpenGL / Live2D C++ faults).
     try:
         import faulthandler
-        _fault_fp = open(_Path(PROJECT_ROOT) / "meapet_fault.log", "a", encoding="utf-8")
+        from meapet.paths import get_data_dir
+        _fault_fp = open(_Path(get_data_dir()) / "meapet_fault.log", "a", encoding="utf-8")
         faulthandler.enable(file=_fault_fp, all_threads=True)
     except Exception:
         pass
 
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    boot_log = _Path(PROJECT_ROOT) / "meapet_boot.log"
+    from meapet.paths import get_data_dir, migrate_legacy_home_data
+    boot_log = _Path(get_data_dir()) / "meapet_boot.log"
 
     try:
         boot_log.write_text(
@@ -565,9 +573,28 @@ def main():
     except Exception:
         pass
 
+    try:
+        for note in migrate_legacy_home_data():
+            log.info(f"[boot] {note}")
+    except Exception as exc:
+        log.warning(f"[boot] legacy data migration skipped: {exc}")
+
     log.info(f"[boot] python={sys.version.split()[0]} exe={sys.executable}")
-    log.info(f"[boot] cwd={os.getcwd()} root={PROJECT_ROOT}")
+    log.info(f"[boot] cwd={os.getcwd()} root={PROJECT_ROOT} data={get_data_dir()}")
     log.info(f"[boot] FORCE_PNG={os.environ.get('MEAPET_FORCE_PNG', '')}")
+
+    # Live2D 透明窗：在 QApplication 之前请求 alpha+stencil，并在 Windows 上优先
+    # 桌面 OpenGL，减轻打包后 ANGLE/软 GL 把 QOpenGLWidget 合成成不透明矩形。
+    try:
+        if sys.platform == "win32":
+            QApplication.setAttribute(Qt.AA_UseDesktopOpenGL, True)
+        gl_fmt = QSurfaceFormat()
+        gl_fmt.setAlphaBufferSize(8)
+        gl_fmt.setStencilBufferSize(8)
+        gl_fmt.setRenderableType(QSurfaceFormat.OpenGL)
+        QSurfaceFormat.setDefaultFormat(gl_fmt)
+    except Exception as exc:
+        log.warning(f"[boot] OpenGL surface defaults skipped: {exc}")
 
     try:
         app = QApplication(sys.argv)

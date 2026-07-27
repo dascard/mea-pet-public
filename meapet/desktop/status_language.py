@@ -52,7 +52,7 @@ def vision_mode_unavailable(reason: str = "") -> str:
 
 
 def standby_on() -> str:
-    return "梅尔待机中…右键可取消"
+    return "梅尔待机中…点击穿透，右键打开菜单可取消"
 
 
 def standby_off() -> str:
@@ -109,6 +109,15 @@ def menu_render_to_live2d() -> str:
 
 def menu_render_to_png() -> str:
     return "切回 PNG 立绘（当前 Live2D）"
+
+
+def menu_window_size(factor: float) -> str:
+    """窗口大小分组标题，带当前百分比。"""
+    return f"窗口大小 · {round(float(factor) * 100)}%"
+
+
+def window_size_applied(factor: float) -> str:
+    return f"窗口大小已调到 {round(float(factor) * 100)}%"
 
 
 def first_run_hint() -> str:

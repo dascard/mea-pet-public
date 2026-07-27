@@ -31,7 +31,6 @@ tts_debug.log
 chat_errors.log
 
 # 运行时缓存 / 下载物
-voice_cache/
 audio_cache/
 wheels/
 OllamaSetup.exe
@@ -54,3 +53,9 @@ Thumbs.db
 # 构建产物
 mea_pet.egg-info/
 dist/
+build/
+debug_grab_frame.png
+
+# 误提交的运行时/调试残留文件
+/_standby=True
+/stop

@@ -23,6 +23,60 @@ from wizard.styles import (
 from wizard.platform_info import PLATFORM, CONFIG_PATH
 from wizard.env_utils import pip_install, check_installed
 
+
+class _MainThreadInvoker(QObject):
+    """经队列信号把回调投递回主线程执行。
+
+    普通 threading.Thread 里调用 QTimer.singleShot 不会触发——工作线程
+    没有 Qt 事件循环，定时器根本不启动，安装完成回调因此永远丢失。
+    """
+
+    trigger = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        # 发射方在工作线程、本对象归属主线程 → Qt 自动走 QueuedConnection
+        self.trigger.connect(self._run)
+
+    @staticmethod
+    def _run(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+_invoker: Optional[_MainThreadInvoker] = None
+
+
+def _ensure_main_invoker() -> None:
+    """必须在主线程先调用一次，确保投递器的线程亲和是主线程。"""
+    global _invoker
+    if _invoker is None:
+        _invoker = _MainThreadInvoker()
+
+
+def _post_to_main(fn) -> None:
+    """线程安全地把回调排到主线程。
+
+    - 已在主线程：直接 QTimer.singleShot(0, …)（兼容现有测试对 singleShot 的 mock）。
+    - 在工作线程：经 _MainThreadInvoker 的 QueuedConnection 投递，
+      因为工作线程没有 Qt 事件循环，单靠 singleShot 永远不会触发。
+    """
+    app = QApplication.instance()
+    if app is not None and QThread.currentThread() is app.thread():
+        QTimer.singleShot(0, fn)
+        return
+    if _invoker is not None:
+        _invoker.trigger.emit(fn)
+        return
+    # 无 QApplication / 投递器未初始化：同步执行（单元测试的 ImmediateThread 路径）
+    try:
+        fn()
+    except Exception:
+        pass
+
+
 class TtsPageVitsMixin:
     def _browse_python(self, input_field):
         dir_path = styled_open_file(
@@ -31,14 +85,48 @@ class TtsPageVitsMixin:
         if dir_path:
             input_field.setText(dir_path)
 
+    def _is_pet_exe(self, py_exe: str) -> bool:
+        """判断是否为打包版 MeaPet.exe（非真正 Python 解释器）。"""
+        try:
+            from meapet.tts.common import is_pet_executable
+
+            return is_pet_executable(py_exe)
+        except Exception:
+            if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
+                return False
+            try:
+                return os.path.realpath(py_exe) == os.path.realpath(sys.executable)
+            except Exception:
+                return False
+
+    @staticmethod
+    def _path_is_pet_exe(py_exe: str) -> bool:
+        """Static-safe pet-exe check (works when mixin methods are unbound)."""
+        try:
+            from meapet.tts.common import is_pet_executable
+
+            return is_pet_executable(py_exe)
+        except Exception:
+            if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
+                return False
+            try:
+                return os.path.realpath(py_exe) == os.path.realpath(sys.executable)
+            except Exception:
+                return False
+
     def _check_vits(self):
         """检查 VITS 模型是否就绪"""
-        base = os.path.dirname(CONFIG_PATH)
-        model_path = os.path.join(base, "vits_models", "G_latest.pth")
-        config_path = os.path.join(base, "vits_models", "finetune_speaker.json")
+        from meapet.paths import project_path
+
+        model_path = project_path("vits_models", "G_latest.pth")
+        config_path = project_path("vits_models", "finetune_speaker.json")
         if os.path.exists(model_path) and os.path.exists(config_path):
             model_size = os.path.getsize(model_path) / 1e6
-            set_status(self.vits_status, "success", f"VITS 模型就绪（{model_size:.0f} MB）")
+            set_status(
+                self.vits_status,
+                "success",
+                f"VITS 模型就绪（{model_size:.0f} MB；打包版默认进程内合成）",
+            )
         else:
             set_status(
                 self.vits_status,
@@ -47,8 +135,13 @@ class TtsPageVitsMixin:
             )
 
     def _setup_vits_env(self):
-        """用户显式点击后，按需检测/创建 VITS Python 环境（可能下载依赖）"""
-        from PyQt5.QtWidgets import QMessageBox
+        """On explicit user click, detect / create the VITS Python environment.
+
+        In frozen mode ``sys.executable`` is the pet exe, not a real Python
+        interpreter — we skip subprocess calls that point to it and search
+        for a real system Python instead.
+        """
+        _ensure_main_invoker()  # 按钮点击在主线程：先建好跨线程投递器
         ret = styled_message_box(
             self,
             title="按需安装确认",
@@ -65,7 +158,7 @@ class TtsPageVitsMixin:
             return
         import sys as _sys, subprocess, threading, os as _os
         base = os.path.dirname(CONFIG_PATH)
-        log = lambda msg: QTimer.singleShot(0, lambda: self.log(msg)) if hasattr(self, 'log') else None
+        log = lambda msg: _post_to_main(lambda: self.log(msg)) if hasattr(self, 'log') else None
 
         # ── 构建干净的环境（去掉 PYTHONPATH 避免污染其他 Python 的子进程） ──
         _clean_env = _os.environ.copy()
@@ -74,6 +167,9 @@ class TtsPageVitsMixin:
 
         def _check_torch(py_exe: str) -> tuple[bool, str]:
             """检查指定 Python 能否 import torch，返回 (成功, 版本或错误信息)"""
+            # 打包版中 sys.executable 是 MeaPet.exe，不能当 Python 用
+            if TtsPageVitsMixin._path_is_pet_exe(py_exe):
+                return False, "frozen"
             try:
                 r = subprocess.run(
                     [py_exe, "-c", "import torch; print(torch.__version__)"],
@@ -132,7 +228,12 @@ class TtsPageVitsMixin:
             return ok
 
         def _pip_run(py_exe: str, args: list, timeout_sec: int = 600) -> int:
-            """通用 pip install（实时输出+超时保护，干净环境）"""
+            """通用 pip install（实时输出+超时保护，干净环境）
+
+            冻结模式且 py_exe 是 pet exe 时直接返回失败，避免启动重复进程。
+            """
+            if TtsPageVitsMixin._path_is_pet_exe(py_exe):
+                return 1
             _pip_env = _clean_env.copy()
             _pip_env["PYTHONUNBUFFERED"] = "1"  # 关掉子进程缓冲，每行实时可见
             proc = subprocess.Popen(
@@ -157,10 +258,10 @@ class TtsPageVitsMixin:
                         _pct = int(_m.group(1))
                         if _pct - _last_pct >= 2:
                             _last_pct = _pct
-                            QTimer.singleShot(0, lambda l=_line: log(f"    {l}"))
+                            _post_to_main(lambda l=_line: log(f"    {l}"))
                         continue
                     # 非进度行直接输出
-                    QTimer.singleShot(0, lambda l=_line: log(f"    {l}"))
+                    _post_to_main(lambda l=_line: log(f"    {l}"))
 
             _reader_thread = threading.Thread(target=_reader, daemon=True)
             _reader_thread.start()
@@ -171,7 +272,7 @@ class TtsPageVitsMixin:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-                QTimer.singleShot(0, lambda: log("  ❌ 超时（>{}s），pip 安装中断".format(timeout_sec)))
+                _post_to_main(lambda: log("  ❌ 超时（>{}s），pip 安装中断".format(timeout_sec)))
                 return 1
 
             _reader_thread.join(timeout=5)  # 等 reader 读完残存输出
@@ -214,7 +315,7 @@ class TtsPageVitsMixin:
             self.setup_vits_btn.setText("正在安装 PyTorch 到 _python…")
             def _task_embedded():
                 _pip_install_deps(_embedded, "[_python] ")
-                QTimer.singleShot(0, lambda: self._on_vits_env_done(True, _embedded))
+                _post_to_main(lambda: self._on_vits_env_done(True, _embedded))
             threading.Thread(target=_task_embedded, daemon=True).start()
             return
 
@@ -262,8 +363,16 @@ class TtsPageVitsMixin:
 
         def task():
             try:
-                # 创建 venv
-                subprocess.run([_sys.executable, "-m", "venv", venv_path],
+                # 创建 venv（冻结模式用 PATH 上的系统 Python 代替 pet exe）
+                _master_py = _sys.executable
+                if TtsPageVitsMixin._path_is_pet_exe(_master_py):
+                    import shutil as _shutil
+                    _master_py = (
+                        _shutil.which("python")
+                        or _shutil.which("python3")
+                        or _master_py
+                    )
+                subprocess.run([_master_py, "-m", "venv", venv_path],
                              capture_output=True, timeout=60)
                 py_path = _os.path.join(venv_path, "Scripts", "python.exe")
                 if not _os.path.isfile(py_path):
@@ -282,18 +391,24 @@ class TtsPageVitsMixin:
                                        dirs_exist_ok=True)
                         log("已复制 pyopenjtalk 词典")
 
-                QTimer.singleShot(0, lambda: self._on_vits_env_done(True, py_path))
+                _post_to_main(lambda: self._on_vits_env_done(True, py_path))
             except Exception as e:
                 error = str(e)
-                QTimer.singleShot(
-                    0,
+                _post_to_main(
                     lambda error=error: self._on_vits_env_done(False, error),
                 )
 
         threading.Thread(target=task, daemon=True).start()
 
     def _ensure_vits_deps(self, py_exe: str, log):
-        """确保 VITS 所需的基础依赖已安装（soundfile, numpy, scipy 等），非阻塞"""
+        """确保 VITS 所需的基础依赖已安装（soundfile, numpy, scipy 等），非阻塞
+
+        打包版中 pet exe 不是真正 Python，跳过子进程检查。
+        """
+        _ensure_main_invoker()  # 主线程入口：先建好跨线程投递器
+        if TtsPageVitsMixin._path_is_pet_exe(py_exe):
+            log("  ⚠ 打包版中无法检查 VITS 依赖（pet exe 不是 Python 解释器）")
+            return
         import subprocess, threading
         needed = []
         _checks = {
@@ -326,11 +441,11 @@ class TtsPageVitsMixin:
                     capture_output=True, text=True, timeout=300, env=env
                 )
                 if r.returncode == 0:
-                    QTimer.singleShot(0, lambda: log("✓ VITS 依赖安装完成"))
+                    _post_to_main(lambda: log("✓ VITS 依赖安装完成"))
                 else:
-                    QTimer.singleShot(0, lambda: log(f"  ⚠ pip 安装失败: {r.stderr[-150:]}"))
+                    _post_to_main(lambda: log(f"  ⚠ pip 安装失败: {r.stderr[-150:]}"))
             except subprocess.TimeoutExpired:
-                QTimer.singleShot(0, lambda: log("  ⚠ pip 安装超时，VITS 可能无法正常工作"))
+                _post_to_main(lambda: log("  ⚠ pip 安装超时，VITS 可能无法正常工作"))
         threading.Thread(target=_task, daemon=True).start()
 
     def _on_vits_env_done(self, ok, result):

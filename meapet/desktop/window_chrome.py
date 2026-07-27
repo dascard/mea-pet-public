@@ -13,13 +13,25 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon,
 )
 from PyQt5.QtGui import QIcon
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QRect, Qt
 
 from meapet.desktop import status_language
 from meapet.desktop.icons import standard_icon
+from meapet.desktop.screen_geometry import (
+    available_geometry_for,
+    calculate_centered_position,
+    calculate_popup_position,
+    move_within_screen,
+    widget_size,
+)
 from meapet.desktop.theme import COLOR_ACCENT, COLOR_ACCENT_2, MENU_STYLE
 from meapet.paths import PROJECT_ROOT
-from meapet.ui_theme import PALETTE, set_scaled_stylesheet
+from meapet.ui_theme import (
+    PALETTE,
+    PET_SIZE_PRESETS,
+    normalize_pet_size_factor,
+    set_scaled_stylesheet,
+)
 from meapet.utils import safe_print
 
 
@@ -107,6 +119,10 @@ class PetWindowChromeMixin:
 
     def _quit(self):
         safe_print("[pet] quitting by user/menu…")
+        try:
+            self._close_menu_window()
+        except Exception:
+            pass
         stop_control = getattr(self, "_stop_control", None)
         if callable(stop_control):
             try:
@@ -128,19 +144,28 @@ class PetWindowChromeMixin:
             self._watcher_timer.stop()
         except Exception:
             pass
+        # 退出路径只发取消/停止信号，不在 GUI 线程 join worker 或 QThread，
+        # 避免 MCP/watcher/TTS 叠加 wait 把窗口卡成“未响应”。
         if hasattr(self, "_watcher") and self._watcher is not None:
             try:
-                self._watcher.stop()
-                self._watcher.wait(3000)
+                self._watcher.stop(timeout_ms=0)
+            except TypeError:
+                try:
+                    self._watcher.stop()
+                except Exception:
+                    pass
             except Exception:
                 pass
         for attr in ["_chat_worker", "_tts_worker", "_speak_worker"]:
             w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.wait(3000)
-                except Exception:
-                    pass
+            if w is None:
+                continue
+            try:
+                terminate = getattr(w, "terminate", None)
+                if callable(terminate):
+                    terminate()
+            except Exception:
+                pass
         if hasattr(self, "tray"):
             try:
                 self.tray.hide()
@@ -189,7 +214,7 @@ class PetWindowChromeMixin:
 
     def _toggle_auto_start(self):
         if sys.platform != "win32":
-            self._show_bubble("开机自启目前仅支持 Windows 喵", 2500)
+            self._show_bubble("Autostart currently only supports Windows", 2500)
             return
         import winreg
         key = winreg.OpenKey(
@@ -202,14 +227,19 @@ class PetWindowChromeMixin:
             winreg.QueryValueEx(key, "MeaPet")
             winreg.DeleteValue(key, "MeaPet")
             winreg.CloseKey(key)
-            self._show_bubble("已关闭开机自启喵", 2000)
+            self._show_bubble("Autostart disabled", 2000)
         except FileNotFoundError:
             winreg.CloseKey(key)
-            py = sys.executable.replace("python.exe", "pythonw.exe")
-            if not os.path.exists(py):
-                py = sys.executable
-            pet_path = str(PROJECT_ROOT / "pet.py")
-            cmd = f'"{py}" "{pet_path}"'
+            # Build the command to register.
+            if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                # PyInstaller build: exe path is already the launcher.
+                cmd = f'"{sys.executable}"'
+            else:
+                py = sys.executable.replace("python.exe", "pythonw.exe")
+                if not os.path.exists(py):
+                    py = sys.executable
+                pet_path = str(PROJECT_ROOT / "pet.py")
+                cmd = f'"{py}" "{pet_path}"'
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
                 r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -218,7 +248,7 @@ class PetWindowChromeMixin:
             )
             winreg.SetValueEx(key, "MeaPet", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
-            self._show_bubble("已开启开机自启喵 🖥️", 2000)
+            self._show_bubble("Autostart enabled", 2000)
 
 
     def _build_tray_menu(self) -> QMenu:
@@ -391,9 +421,29 @@ class PetWindowChromeMixin:
         mode_action.triggered.connect(self._toggle_render_mode)
         display_menu.addAction(mode_action)
 
-        size_action = QAction("调整立绘大小…", self)
+        current_factor = normalize_pet_size_factor(
+            (self.config.get("display") or {}).get("size_factor", 1.0)
+        )
+        size_menu = QMenu(
+            status_language.menu_window_size(current_factor), self
+        )
+        size_menu.setObjectName("WindowSizeMenu")
+        set_scaled_stylesheet(size_menu, MENU_STYLE)
+        size_menu.setAccessibleName("桌宠窗口大小")
+        for percent in PET_SIZE_PRESETS:
+            preset_action = QAction(f"{percent}%", self)
+            preset_action.setCheckable(True)
+            preset_action.setChecked(round(current_factor * 100) == percent)
+            preset_action.triggered.connect(
+                lambda _checked=False, p=percent: self._set_size_factor(p / 100.0)
+            )
+            size_menu.addAction(preset_action)
+        size_menu.addSeparator()
+        size_action = QAction("自定义…", self)
+        size_action.setToolTip("滑块实时预览，30%–300%")
         size_action.triggered.connect(self._open_size_dialog)
-        display_menu.addAction(size_action)
+        size_menu.addAction(size_action)
+        display_menu.addMenu(size_menu)
         menu.addMenu(display_menu)
 
         settings_menu = QMenu("设置与数据", self)
@@ -449,16 +499,76 @@ class PetWindowChromeMixin:
         return menu
 
     def _show_context_menu(self, pos):
-        menu = self._build_context_menu()
-        menu.exec_(self.mapToGlobal(pos))
+        """以独立可拖动窗口的形式打开右键菜单。"""
+        # 待机穿透重开菜单与 Qt CustomContextMenu 可能叠到同一次右键，避免重入。
+        if getattr(self, "_context_menu_executing", False):
+            return
+        self._context_menu_executing = True
+        try:
+            self._close_menu_window()
+            from meapet.desktop.menu_window import PetMenuWindow
+
+            menu = self._build_context_menu()
+            window = PetMenuWindow(menu, None)
+            self._menu_window = window
+            window.show_at(self.mapToGlobal(pos))
+        except Exception as exc:
+            safe_print(f"[menu] 打开菜单窗口失败: {type(exc).__name__}: {exc}")
+        finally:
+            self._context_menu_executing = False
+
+    def _close_menu_window(self) -> None:
+        """关闭并释放上一次的菜单窗口（含其源 QMenu）。"""
+        window = getattr(self, "_menu_window", None)
+        self._menu_window = None
+        if window is None:
+            return
+        try:
+            source = getattr(window, "_source_menu", None)
+            window.close()
+            window.deleteLater()
+            if source is not None:
+                source.deleteLater()
+        except Exception:
+            pass
 
     def _show_status_panel(self):
         from meapet.desktop.status_panel import StatusPanel
         if not hasattr(self, "_status_panel") or self._status_panel is None:
             self._status_panel = StatusPanel(self.memory)
-            self._status_panel.move(self.x() + self.width() + 10, self.y())
+            self._place_beside_pet(self._status_panel, placement="right", gap=10)
+        else:
+            # 已存在的面板保留用户拖动过的位置，只在越界时（换屏幕、改分辨率）拉回来。
+            move_within_screen(self._status_panel, self._status_panel.pos())
         self._status_panel.show()
         self._status_panel.refresh()
+
+    def _pet_rect(self) -> QRect:
+        return QRect(self.x(), self.y(), self.width(), self.height())
+
+    def _place_beside_pet(self, window, *, placement: str, gap: int) -> None:
+        """把弹出窗口放在桌宠旁边，并保证完整落在所在屏幕的可用区域内。"""
+        pet_rect = self._pet_rect()
+        size = widget_size(window)
+        area = available_geometry_for(pet_rect)
+        if area is None:
+            window.move(pet_rect.right() + 1 + gap, pet_rect.top())
+            return
+        window.move(
+            calculate_popup_position(
+                pet_rect, size, area, placement=placement, gap=gap
+            )
+        )
+
+    def _place_dialog_near_pet(self, dialog) -> None:
+        """对话框以桌宠为中心显示；桌宠贴边时夹回屏幕内，避免标题栏跑到屏幕外。"""
+        pet_rect = self._pet_rect()
+        area = available_geometry_for(pet_rect)
+        if area is None:
+            return
+        dialog.move(
+            calculate_centered_position(pet_rect, widget_size(dialog), area)
+        )
 
     def _show_timeline(self) -> None:
         timeline = getattr(self, "_conversation_timeline", None)
@@ -471,6 +581,9 @@ class PetWindowChromeMixin:
         if dialog is None:
             dialog = TimelineDialog(timeline, self)
             self._timeline_dialog = dialog
+            self._place_dialog_near_pet(dialog)
+        else:
+            move_within_screen(dialog, dialog.pos())
         dialog.refresh()
         dialog.show()
         dialog.raise_()
@@ -486,6 +599,7 @@ class PetWindowChromeMixin:
 
         dialog = TurnDetailDialog(turn, self)
         self._timeline_turn_dialog = dialog
+        self._place_dialog_near_pet(dialog)
         dialog.show()
         dialog.raise_()
 
@@ -533,7 +647,6 @@ class PetWindowChromeMixin:
         if worker is not None and callable(getattr(worker, "terminate", None)):
             try:
                 worker.terminate()
-                worker.wait(1000)
             except Exception:
                 pass
 

@@ -1,4 +1,4 @@
-"""共享对话契约：多段回复、流式解析、能力摘要与配置迁移。"""
+"""共享对话契约：多段回复、流式解析、能力摘要与配置迁移（OpenAI 兼容版）。"""
 
 from __future__ import annotations
 
@@ -97,6 +97,7 @@ class TestReplyOutputContract(unittest.TestCase):
         result = parse_reply_output(source)
 
         self.assertEqual(result.segments[0].missing_required_fields, ("voice_language",))
+        self.assertTrue(result.segments[0].missing_required_fields)
         self.assertTrue(result.requires_repair(tts_enabled=True))
         self.assertFalse(result.requires_repair(tts_enabled=False))
 
@@ -219,10 +220,11 @@ class TestConversationConfigMigration(unittest.TestCase):
         )
 
         self.assertEqual(cfg["llm"]["mode"], "direct")
+        # provider 现在是 "custom"（统一 OpenAI 兼容）
         self.assertEqual(
             cfg["llm"]["direct"],
             {
-                "provider": "deepseek",
+                "provider": "custom",
                 "protocol": "openai_chat",
                 "api_base": "https://deepseek.example/v1",
                 "host": "",
@@ -232,27 +234,116 @@ class TestConversationConfigMigration(unittest.TestCase):
                 "max_tokens": 4096,
             },
         )
-        self.assertEqual(cfg["llm"]["backend"], "deepseek")
+        # direct 段不再有 backend 概念
+        self.assertNotIn("backend", cfg["llm"]["direct"])
+        # 顶层 backend 与 direct.provider 对齐，消除 deepseek/custom 分叉
+        self.assertEqual(cfg["llm"]["backend"], "custom")
 
-    def test_legacy_openclaw_config_migrates_to_agent_without_generic_kind(self):
+    def test_explicit_deepseek_provider_collapses_to_custom(self):
         from meapet.config.store import normalize_config
 
         cfg = normalize_config(
             {
                 "llm": {
-                    "backend": "openclaw",
-                    "bridge_url": "ws://192.168.1.8:18789",
+                    "mode": "direct",
+                    "backend": "deepseek",
+                    "direct": {
+                        "provider": "deepseek",
+                        "protocol": "openai_chat",
+                        "api_base": "https://api.deepseek.com",
+                        "model": "deepseek-chat",
+                    },
+                }
+            }
+        )
+        self.assertEqual(cfg["llm"]["direct"]["provider"], "custom")
+        self.assertEqual(cfg["llm"]["backend"], "custom")
+        self.assertEqual(cfg["llm"]["direct"]["protocol"], "openai_chat")
+
+    def test_ollama_and_mimo_providers_also_collapse_to_custom(self):
+        from meapet.config.store import normalize_config
+
+        ollama = normalize_config(
+            {
+                "llm": {
+                    "mode": "direct",
+                    "backend": "ollama",
+                    "host": "http://127.0.0.1:11434",
+                    "model": "qwen",
+                }
+            }
+        )
+        self.assertEqual(ollama["llm"]["direct"]["provider"], "custom")
+        self.assertEqual(ollama["llm"]["backend"], "custom")
+        self.assertEqual(ollama["llm"]["direct"]["protocol"], "ollama_chat")
+
+        mimo = normalize_config(
+            {
+                "llm": {
+                    "mode": "direct",
+                    "direct": {
+                        "provider": "mimo",
+                        "api_base": "https://api.xiaomimimo.com/v1",
+                        "model": "mimo-v2",
+                    },
+                }
+            }
+        )
+        self.assertEqual(mimo["llm"]["direct"]["provider"], "custom")
+        self.assertEqual(mimo["llm"]["backend"], "custom")
+        self.assertEqual(mimo["llm"]["direct"]["protocol"], "openai_chat")
+
+    def test_custom_deepseek_url_reads_deepseek_env_key(self):
+        import os
+        from unittest import mock
+
+        from meapet.config.store import resolve_direct_api_key
+
+        llm = {
+            "backend": "custom",
+            "direct": {
+                "provider": "custom",
+                "api_base": "https://api.deepseek.com",
+                "api_key": "",
+            },
+        }
+        env = {
+            "DEEPSEEK_API_KEY": "ds-from-env",
+            "OPENAI_API_KEY": "",
+            "MEAPET_API_KEY": "",
+            "MIMO_API_KEY": "",
+            "XIAOMIMIMO_API_KEY": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(resolve_direct_api_key(llm), "ds-from-env")
+
+    def test_legacy_openclaw_config_migrates_to_agent_with_openai_compatible_fields(self):
+        from meapet.config.store import normalize_config
+
+        cfg = normalize_config(
+            {
+                "llm": {
+                    "mode": "agent",
+                    "agent": {
+                        "bridge_url": "ws://192.168.1.8:18789",
+                    },
                 }
             }
         )
 
+        # 配置应该迁移为 agent 模式
         self.assertEqual(cfg["llm"]["mode"], "agent")
-        self.assertEqual(cfg["llm"]["agent"]["kind"], "openclaw")
-        self.assertEqual(
-            cfg["llm"]["agent"]["base_url"],
-            "ws://192.168.1.8:18789",
-        )
-        self.assertNotEqual(cfg["llm"]["agent"]["kind"], "generic")
+        agent = cfg["llm"]["agent"]
+        # kind 字段已被清理（不再有 hermes/openclaw 分支）
+        self.assertNotIn("kind", agent)
+        # bridge_url 是旧字段，应被清除
+        self.assertNotIn("bridge_url", agent)
+        # 其他旧字段也不存在
+        self.assertNotIn("auth_token", agent)
+        self.assertNotIn("session_id", agent)
+        self.assertNotIn("session_key", agent)
+        # base_url 应有默认值（bridge_url 不被自动转换）
+        self.assertEqual(agent["base_url"], "https://api.openai.com/v1")
 
     def test_agent_control_defaults_are_closed_and_local(self):
         from meapet.config.store import normalize_config
@@ -282,7 +373,10 @@ class TestConversationConfigMigration(unittest.TestCase):
                 "llm": {
                     "api_key": "legacy-secret",
                     "direct": {"api_key": "direct-secret"},
-                    "agent": {"auth_token": "agent-secret"},
+                    "agent": {
+                        "api_key": "agent-key-secret",
+                        "auth_token": "agent-token-secret",  # 旧字段兼容
+                    },
                 },
                 "agent_control": {"auth_token": "control-secret"},
             }
@@ -290,9 +384,13 @@ class TestConversationConfigMigration(unittest.TestCase):
 
         self.assertEqual(scrubbed["llm"]["api_key"], "")
         self.assertEqual(scrubbed["llm"]["direct"]["api_key"], "")
+        # 新字段 api_key 被清除
+        self.assertEqual(scrubbed["llm"]["agent"]["api_key"], "")
+        # 旧字段 auth_token 也兼容清除
         self.assertEqual(scrubbed["llm"]["agent"]["auth_token"], "")
         self.assertEqual(scrubbed["agent_control"]["auth_token"], "")
 
 
 if __name__ == "__main__":
     unittest.main()
+

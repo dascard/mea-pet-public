@@ -1,6 +1,6 @@
 """
 梅尔桌宠 - LLM 对话模块
-支持多种后端：Ollama、DeepSeek API、MiMo API
+统一使用 OpenAI 兼容接口，不再区分后端类型。
 """
 import json
 import sys
@@ -18,9 +18,6 @@ log = get_color_logger("chat")
 if TYPE_CHECKING:
     from meapet.memory.db import MeaMemory
 
-# Windows GBK 兼容 — 由 pet.py 统一调用 ensure_utf8_stdout()
-# 各模块不重复包装 stdout，避免多次 TextIOWrapper 后旧 wrapper GC 时关闭底层 buffer
-
 
 def _safe_print(*args, **kwargs):
     """GUI 安全版 print，并对常见凭据格式自动脱敏。"""
@@ -36,7 +33,7 @@ def _safe_print(*args, **kwargs):
 # ========================
 PERSONA_PROMPT = """你是梅尔，《霞流宝石心》游戏中的猫娘天才。茶发褐瞳144cm，面无表情。
 性格：毒舌冷淡、学术狂热、嘴硬心软。
-说话：句尾加「喵」；极简20-40字；解释≤80字；害羞时转移话题；开心偶尔「嘿嘿」。
+说话：句尾加「喵」；输出不能超过80字；害羞时转移话题；开心偶尔「嘿嘿」。
 知识：全科全能。信条「知道越多越不可怕」。
 对主人：亲密但毒舌，称「主人」。"""
 
@@ -68,39 +65,79 @@ _TTS_DELIVERY_MAX_CHARS = 60
 
 
 class ChatEngine:
-    """多后端对话引擎 + 记忆/养成系统"""
+    """统一对话引擎 + 记忆/养成系统。
+
+    传输层按 protocol 分流（ollama 原生 / OpenAI 兼容），
+    协议与密钥解析都以 llm.direct 显式 profile 为准。
+    provider 身份标签恒为 custom，不按厂商品牌分后端。
+    """
+
+    # Agent 类后端没有直连实现，只能走 llm.mode=agent。
+    _UNSUPPORTED_DIRECT_BACKENDS = frozenset({"openclaw", "hermes"})
 
     def __init__(
         self,
-        backend: str = "ollama",
-        host: str = "http://127.0.0.1:11434",
-        model: str = "qwen3.5:4b",
+        backend: str = "custom",
+        protocol: str = "",
+        host: str = "http://127.0.0.1:11434",       # 兼容旧配置，实际优先使用 api_base
+        model: str = "gpt-4o-mini",
         api_key: str = "",
         api_base: str = "",
         temperature: float = 0.7,
         memory: "MeaMemory" = None,
         bridge_url: str = "http://127.0.0.1:18888",
-        protocol: str = "",
         max_tokens: int = 4096,
         direct_client=None,
+        extra_headers: dict | None = None,
+        timeout_seconds: float = 0.0,
+        proxy: str = "",
+        thinking: dict | None = None,
     ):
-        self.backend = backend
+        # 身份标签一律 custom；真正分流看 protocol / api_base。
+        self.backend = "custom"
         self.host = host
         self.model = model
         self.api_key = api_key
         self.api_base = api_base
         self.temperature = temperature
-        self.protocol = (
-            str(protocol or "").strip().lower()
-            or ("ollama_chat" if backend == "ollama" else "openai_chat")
-        )
+        # 供应商自定义请求头（llm.direct.headers），透传给直连客户端。
+        self.extra_headers = {
+            str(k): str(v) for k, v in (extra_headers or {}).items()
+        }
+        self.proxy = str(proxy or "").strip()
+        self.thinking = dict(thinking or {})
+        try:
+            self.timeout_seconds = float(timeout_seconds or 0)
+        except (TypeError, ValueError):
+            self.timeout_seconds = 0.0
+        if not protocol:
+            from meapet.config.store import infer_direct_protocol
+            protocol = infer_direct_protocol(
+                "custom",
+                api_base=self.api_base,
+                host=self.host,
+            )
+        self.protocol = str(protocol).strip().lower() or "openai_chat"
         try:
             self.max_tokens = max(1, int(max_tokens))
         except (TypeError, ValueError):
             self.max_tokens = 4096
         self.bridge_url = bridge_url.rstrip("/")
-        self.available = False
-        self.memory = memory  # MeaMemory 实例
+        self.memory = memory
+
+        raw_backend = str(backend or "custom").strip().lower() or "custom"
+        if raw_backend in self._UNSUPPORTED_DIRECT_BACKENDS:
+            # 不虚假宣传可用性：openclaw/hermes 只有 Agent 模式实现
+            self.available = False
+            _safe_print(
+                f"⚠ {raw_backend} 直连后端未实现，请将 llm.mode 设为 agent",
+                flush=True,
+            )
+        else:
+            # 统一假定可用：连接失败时再走 fallback。
+            self.available = True
+            _safe_print(f"✓ 模型服务已配置: {self.model}", flush=True)
+        self._backend_ready = True
 
         self.history: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -110,47 +147,48 @@ class ChatEngine:
         self._direct_client = direct_client
         self._direct_adapter = None
 
-        self._backend_ready = False
-        # 云端 API 同步就绪；Ollama 后台探测，避免阻塞启动
-        if self.backend == "ollama":
-            self._deferred_check()
-        elif self.backend == "deepseek":
-            if self.api_key:
-                self.available = True
-                _safe_print(f"✓ DeepSeek API configured: {self.model}", flush=True)
-            else:
-                _safe_print("⚠ DeepSeek API: no key", flush=True)
-            self._backend_ready = True
-        elif self.backend == "mimo":
-            if self.api_key:
-                self.available = True
-                _safe_print(f"✓ MiMo API configured: {self.model}", flush=True)
-            else:
-                _safe_print("⚠ MiMo API: no key", flush=True)
-            self._backend_ready = True
-        elif self.backend == "openclaw":
-            self._backend_ready = True
-            _safe_print("⚠ OpenClaw 后端尚未实现，已标记为不可用", flush=True)
-        elif self.backend == "custom":
-            self.available = bool(self.model and (self.api_base or self.host))
-            self._backend_ready = True
-            if self.available:
-                _safe_print(
-                    f"✓ Custom direct model configured: {self.model}",
-                    flush=True,
-                )
-        else:
-            _safe_print(f"⚠ Unknown backend: {self.backend}", flush=True)
-            self._backend_ready = True
-
     def cancel(self):
         """协作式取消：标记取消位（httpx 请求在超时后结束）。"""
         self._cancelled = True
 
+    def _debug_dump(self, label: str, payload, limit: int = 2000) -> None:
+        """载荷级调试转储：仅 MEAPET_DEBUG=1 时输出，经 _safe_print 统一脱敏。"""
+        if not debug_enabled():
+            return
+        try:
+            text = payload if isinstance(payload, str) else repr(payload)
+        except Exception:
+            return
+        try:
+            bound = max(0, int(limit))
+        except (TypeError, ValueError):
+            bound = 2000
+        _safe_print(f"[debug] {label}: {text[:bound]}", flush=True)
+
+    def _deferred_check(self) -> None:
+        """后台连通性探测（仅本地 ollama 协议）；探测失败不推翻「假定可用」。
+
+        只允许桌面初始化路径在工作线程调用，解析/识图等纯函数路径不得触发。
+        """
+        protocol = str(getattr(self, "protocol", "") or "").strip().lower()
+        if protocol != "ollama_chat":
+            return
+        try:
+            from meapet.async_runtime import run as _arun
+            base = (self.api_base or self.host or "http://127.0.0.1:11434").rstrip("/")
+            # Ollama tags 在 host 根，不在 /v1
+            if base.endswith("/v1"):
+                base = base[:-3].rstrip("/")
+            resp = _arun(self._get_json(f"{base}/api/tags", timeout=3), timeout=5)
+            if getattr(resp, "status_code", 0) == 200:
+                self.available = True
+        except Exception:
+            pass
+
     def _direct_base_url(self) -> str:
-        if self.protocol == "ollama_chat":
-            return str(self.host or "http://127.0.0.1:11434").rstrip("/")
-        return str(self.api_base or "").rstrip("/")
+        # 优先使用 api_base，其次 host
+        base = (self.api_base or self.host or "http://127.0.0.1:11434").rstrip("/")
+        return base
 
     def _get_direct_adapter(self):
         if self._direct_adapter is not None:
@@ -162,10 +200,18 @@ class ChatEngine:
         if client is None:
             client = DirectProtocolClient(
                 DirectProtocolConfig(
-                    protocol=self.protocol,
+                    protocol=self.protocol or "openai_chat",   # 尊重 llm.direct.protocol
                     base_url=self._direct_base_url(),
                     api_key=self.api_key,
-                    timeout_seconds=120.0,
+                    # 用户显式配置的超时优先；未配置时按 max_tokens 估算下限。
+                    timeout_seconds=(
+                        self.timeout_seconds
+                        if self.timeout_seconds > 0
+                        else max(300.0, (self.max_tokens / 1000) * 60.0)
+                    ),
+                    extra_headers=self.extra_headers,
+                    proxy=self.proxy,
+                    thinking=self.thinking,
                 )
             )
             self._direct_client = client
@@ -192,15 +238,25 @@ class ChatEngine:
             if len(self.history) > 16:
                 saved_system = self.history[0]
                 self.history = [saved_system] + self.history[-14:]
+
+            system = PERSONA_PROMPT
+            if self.memory:
+                context = self.memory.build_context_prompt(current_query=message)
+                if context:
+                    system += "\n\n" + context
+            self.history[0] = {"role": "system", "content": system}
             snapshot = [dict(item) for item in self.history]
 
+        return snapshot
+
+    def _build_vision_system_prompt(self, message: str) -> str:
+        """构建识图轮次的系统提示词（不修改持久历史）。"""
         system = PERSONA_PROMPT
         if self.memory:
             context = self.memory.build_context_prompt(current_query=message)
             if context:
                 system += "\n\n" + context
-        snapshot[0] = {"role": "system", "content": system}
-        return snapshot
+        return system
 
     def _rollback_direct_turn(self, message: str) -> None:
         with self._history_lock:
@@ -221,12 +277,14 @@ class ChatEngine:
             return
         with self._history_lock:
             self.history.append({"role": "assistant", "content": reply})
+            # 同步更新 history[0] 为新格式，避免下次 snapshot 带上旧版输出指令。
+            if self.history and str(self.history[0].get("content", "")).startswith("你是梅尔"):
+                self.history[0] = {"role": "system", "content": PERSONA_PROMPT}
 
 
     async def _post_json(self, url: str, *, headers=None, json_body=None, timeout=30):
         """真异步 HTTP（httpx）。"""
         from meapet.http_async import post_json
-        # httpx timeout: float seconds
         to = timeout
         if isinstance(timeout, (tuple, list)) and len(timeout) >= 2:
             to = float(timeout[1])
@@ -235,51 +293,6 @@ class ChatEngine:
     async def _get_json(self, url: str, timeout=5):
         from meapet.http_async import get_json
         return await get_json(url, timeout=float(timeout))
-
-    def _deferred_check(self):
-        """线程内检测 Ollama（不阻塞 __init__）"""
-        t = threading.Thread(target=self._check_backend, daemon=True)
-        t.start()
-
-    def _check_ready(self) -> bool:
-        """检查后端是否已检测完成（供外部调用）"""
-        return self._backend_ready
-
-    def _check_backend(self):
-        """检查 Ollama 是否可用（后台线程；HTTP 走 httpx）"""
-        try:
-            if self.backend != "ollama":
-                return
-            from meapet.async_runtime import run as _arun
-            from meapet.http_async import get_json
-            resp = _arun(get_json(f"{self.host}/api/tags", timeout=5.0), timeout=10)
-            if resp.status_code == 200:
-                models = [m["name"] for m in resp.json().get("models", [])]
-                # 精确匹配或带 tag 前缀匹配（qwen2.5:7b / qwen2.5:7b-instruct）
-                if self.model in models or any(m.startswith(self.model.split(":")[0]) and self.model in m for m in models):
-                    self.available = True
-                    _safe_print(f"✓ Ollama: {self.model}", flush=True)
-                else:
-                    chat_models = [m for m in models
-                                   if any(t in m for t in ["qwen", "deepseek",
-                                    "minicpm", "llama", "mistral", "gemma"])]
-                    if chat_models:
-                        self.model = chat_models[0]
-                        self.available = True
-                        _safe_print(f"✓ Ollama: using {self.model}", flush=True)
-                    else:
-                        _safe_print("⚠ Ollama: no chat model found", flush=True)
-        except Exception as e:
-            msg = str(e).lower()
-            name = type(e).__name__
-            if "timeout" in msg or "Timeout" in name:
-                _safe_print(f"⚠ Ollama 超时，请确认已启动: {self.host}", flush=True)
-            elif "connect" in msg or "Connection" in name:
-                _safe_print(f"⚠ Ollama 未连接: {self.host}", flush=True)
-            else:
-                _safe_print(f"⚠ Ollama 检测异常: {e}", flush=True)
-        finally:
-            self._backend_ready = True
 
 
     _MOOD_TAGS = {
@@ -333,13 +346,12 @@ class ChatEngine:
             return False
         if not cls._has_japanese_kana(s):
             return False
-        # 允许少量汉字/标点；若含大量拉丁字母则不像日语对白
         latin = sum(1 for c in s if ("a" <= c.lower() <= "z"))
         return latin <= max(2, len(s) // 8)
 
     @classmethod
     def _render_tts_style(cls, raw_json: str) -> str:
-        """校验模型 TTS JSON，并渲染成可发送给 MiMo 的自然语言指令。"""
+        """校验模型 TTS JSON，并渲染成可发送给 TTS 引擎的自然语言指令。"""
         try:
             payload = json.loads(raw_json)
         except (json.JSONDecodeError, TypeError):
@@ -500,6 +512,7 @@ class ChatEngine:
                 self.history = [saved_system] + self.history[-14:]
 
             if not self.available:
+                _safe_print(f"[DEBUG] chat() 拦截: available=False", flush=True)
                 self.history.pop()
                 if self.memory:
                     self.history[0] = {"role": "system", "content": SYSTEM_PROMPT}
@@ -568,154 +581,21 @@ class ChatEngine:
             return self._fallback_reply(), "neutral"
 
     async def _dispatch_chat_async(self, messages: List[Dict[str, str]]) -> str:
-        if self.backend == "ollama":
+        """按 protocol 分发：ollama_chat 走原生 /api/chat，其余走 OpenAI 兼容。"""
+        protocol = str(getattr(self, "protocol", "") or "").strip().lower()
+        if protocol == "ollama_chat":
             return await self._chat_ollama_async(messages)
-        if self.backend == "deepseek":
-            return await self._chat_deepseek_async(messages)
-        if self.backend == "mimo":
+        # MiMo 等 OpenAI 兼容端点共用同一路径；default_base 仅作 api_base 空时兜底。
+        from meapet.config.store import detect_endpoint_family
+
+        family = detect_endpoint_family(self.api_base, self.host)
+        if family == "mimo":
             return await self._chat_mimo_async(messages)
-        return self._fallback_reply()
-
-
-    @staticmethod
-    def _auto_start_ollama() -> None:
-        """Best-effort start of local Ollama when health check fails."""
-        import subprocess
-        import time as _time
-        try:
-            if sys.platform == "win32":
-                subprocess.Popen(
-                    ["ollama", "serve"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            else:
-                subprocess.Popen(
-                    ["ollama", "serve"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            _time.sleep(1.5)
-        except Exception:
-            pass
-
-    async def _chat_ollama_async(self, messages: List[Dict[str, str]] = None) -> str:
-        import time as _time
-        msgs = messages if messages is not None else self.history
-        t0 = _time.time()
-        total_chars = sum(len(m.get("content", "")) for m in msgs)
-        _safe_print(f"[chat] 发送请求(async): model={self.model} messages={len(msgs)} 总字符≈{total_chars}", flush=True)
-        try:
-            resp = await self._post_json(
-                f"{self.host}/api/chat",
-                json_body={
-                    "model": self.model,
-                    "messages": msgs,
-                    "stream": False,
-                    "keep_alive": "30s",
-                    "think": False,
-                    "options": {
-                        "temperature": self.temperature,
-                        "num_predict": 320,
-                        "num_ctx": 8192,
-                        "top_p": 0.85,
-                        "repeat_penalty": 1.1,
-                    },
-                },
-                timeout=(5, 120),
-            )
-        except Exception as e:
-            _safe_print(f"[chat] Ollama async 异常: {type(e).__name__}", flush=True)
-            self._debug_dump("Ollama exception", e)
-            return self._fallback_reply()
-        t1 = _time.time()
-        _safe_print(f"[chat] Ollama 响应耗时: {t1-t0:.1f}s  status={resp.status_code}", flush=True)
-        if resp.status_code != 200:
-            return self._fallback_reply()
-        content = resp.json().get("message", {}).get("content", "")
-        if not content or not content.strip():
-            return self._fallback_reply()
-        return content
-
-    async def _chat_deepseek_async(self, messages: List[Dict[str, str]] = None) -> str:
-        import time as _time
-        msgs = messages if messages is not None else self.history
-        t0 = _time.time()
-        _safe_print(f"[chat] DeepSeek 请求(async): model={self.model} messages={len(msgs)}", flush=True)
-        try:
-            resp = await self._post_json(
-                f"{self.api_base.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json_body={
-                    "model": self.model,
-                    "messages": msgs,
-                    "temperature": self.temperature,
-                    "max_tokens": 320,
-                },
-                timeout=30,
-            )
-        except Exception as e:
-            _safe_print(f"[chat] DeepSeek async 异常: {type(e).__name__}", flush=True)
-            self._debug_dump("DeepSeek exception", e)
-            return self._fallback_reply()
-        _safe_print(f"[chat] DeepSeek 响应耗时: {_time.time()-t0:.1f}s  status={resp.status_code}", flush=True)
-        if resp.status_code != 200:
-            _safe_print(f"[chat] DeepSeek 错误: status={resp.status_code}", flush=True)
-            self._debug_dump("DeepSeek error body", getattr(resp, "text", ""), limit=2000)
-            return self._fallback_reply()
-        content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not content or not content.strip():
-            return self._fallback_reply()
-        return content
-
-
-
-    @staticmethod
-    def _redact_secret(s: str) -> str:
-        s = (s or "").strip()
-        if not s:
-            return ""
-        if len(s) <= 10:
-            return "*" * len(s)
-        return f"{s[:6]}...{s[-4:]}(len={len(s)})"
-
-    def _debug_dump(self, title: str, obj, *, limit: int = 8000) -> None:
-        """仅在显式调试模式打印载荷；始终对凭据字段脱敏。"""
-        if not debug_enabled():
-            return
-        import json as _json
-        import traceback as _tb
-        try:
-            if isinstance(obj, BaseException):
-                text = redact_text(
-                    "".join(_tb.format_exception(type(obj), obj, obj.__traceback__))
-                )
-            elif isinstance(obj, (dict, list, tuple)):
-                text = _json.dumps(
-                    redact_mapping(obj),
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-            else:
-                text = redact_text(str(obj))
-        except Exception as e:
-            text = f"<dump failed: {e!r}> str={obj!r}"
-        if len(text) > limit:
-            text = text[:limit] + f"\n...[truncated total={len(text)}]"
-        _safe_print(f"[chat] ===== {title} =====", flush=True)
-        for line in text.splitlines() or [""]:
-            _safe_print(f"[chat] {line}", flush=True)
-        _safe_print(f"[chat] ===== /{title} =====", flush=True)
+        return await self._chat_openai_async(messages)
 
     @staticmethod
     def _mimo_message_text(message: dict) -> str:
-        """从 MiMo message 提取可见 content（兼容 list 分段）。"""
+        """从 message 提取可见 content（兼容 list 分段）。"""
         content = (message or {}).get("content") or ""
         if isinstance(content, list):
             parts = []
@@ -751,110 +631,195 @@ class ChatEngine:
             return ""
         return joined[:500]
 
-    async def _chat_mimo_async(self, messages: List[Dict[str, str]] = None) -> str:
+    async def _chat_openai_async(self, messages: List[Dict[str, str]] = None) -> str:
+        """通用 OpenAI 兼容聊天请求"""
         import time as _time
         msgs = messages if messages is not None else self.history
         t0 = _time.time()
-        url = f"{self.api_base.rstrip('/')}/chat/completions"
+        base_url = (self.api_base or self.host or "http://127.0.0.1:11434").rstrip("/")
+        url = f"{base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "api-key": self.api_key,
             "Content-Type": "application/json",
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         body = {
             "model": self.model,
             "messages": msgs,
             "temperature": self.temperature,
-            # 开启深度思考；token 要够 reasoning + 最终 content
-            "max_tokens": 4096,
-            "max_completion_tokens": 4096,
-            "thinking": {"type": "enabled"},
-        }
-        # 载荷仅在 MEAPET_DEBUG=1 时输出，且密钥字段会脱敏。
-        safe_headers = {
-            "Authorization": f"Bearer {self._redact_secret(self.api_key)}",
-            "api-key": self._redact_secret(self.api_key),
-            "Content-Type": "application/json",
+            "max_tokens": self.max_tokens,
         }
         _safe_print(
-            f"[chat] MiMo 请求(async): model={self.model} messages={len(msgs)} "
+            f"[chat] OpenAI 请求(async): model={self.model} messages={len(msgs)} "
             f"chars={sum(len(str(m.get('content', ''))) for m in msgs)}",
             flush=True,
         )
-        self._debug_dump("MiMo REQUEST headers", safe_headers)
-        self._debug_dump("MiMo REQUEST body", body, limit=12000)
         try:
             resp = await self._post_json(
                 url,
                 headers=headers,
                 json_body=body,
-                timeout=120,
+                timeout=(5, 120),
             )
         except Exception as e:
-            _safe_print(
-                f"[chat] MiMo async 异常: type={type(e).__name__}",
-                flush=True,
-            )
-            self._debug_dump("MiMo EXCEPTION traceback", e, limit=12000)
+            _safe_print(f"[chat] OpenAI async 异常: {type(e).__name__}", flush=True)
+            self._debug_dump("OpenAI exception", e)
             return self._fallback_reply()
 
         elapsed = _time.time() - t0
-        status = getattr(resp, "status_code", None)
-        resp_text = ""
-        try:
-            resp_text = resp.text or ""
-        except Exception as e:
-            resp_text = f"<read resp.text failed: {e!r}>"
-        resp_headers = {}
-        try:
-            resp_headers = dict(getattr(resp, "headers", {}) or {})
-        except Exception:
-            resp_headers = {}
         _safe_print(
-            f"[chat] MiMo 响应: status={status} elapsed={elapsed:.1f}s "
-            f"model={self.model} body_len={len(resp_text)}",
+            f"[chat] OpenAI 响应: status={resp.status_code} elapsed={elapsed:.1f}s "
+            f"model={self.model}",
             flush=True,
         )
-        self._debug_dump("MiMo RESPONSE headers", resp_headers, limit=4000)
-        self._debug_dump("MiMo RESPONSE body", resp_text, limit=12000)
-
-        if status != 200:
-            _safe_print(
-                f"[chat] MiMo HTTP {status} → 本地兜底句（不是其它云端模型）",
-                flush=True,
-            )
+        if resp.status_code != 200:
+            _safe_print(f"[chat] OpenAI HTTP {resp.status_code} → 本地兜底句", flush=True)
+            self._debug_dump("OpenAI error body", getattr(resp, "text", ""), limit=2000)
             return self._fallback_reply()
 
         try:
             data = resp.json()
         except Exception as e:
-            _safe_print(f"[chat] MiMo JSON 解析失败: {type(e).__name__}", flush=True)
-            self._debug_dump("MiMo RESPONSE raw (json fail)", resp_text, limit=12000)
+            _safe_print(f"[chat] OpenAI JSON 解析失败: {type(e).__name__}", flush=True)
             return self._fallback_reply()
 
-        self._debug_dump("MiMo RESPONSE json", data, limit=12000)
         message = (data.get("choices") or [{}])[0].get("message") or {}
         content = self._mimo_message_text(message)
         reasoning = (message.get("reasoning_content") or "").strip()
-        _safe_print(
-            f"[chat] MiMo parsed content_len={len(content)} reasoning_len={len(reasoning)} "
-            f"finish={(data.get('choices') or [{}])[0].get('finish_reason')}",
-            flush=True,
-        )
         if not content:
             if reasoning:
                 content = self._mimo_content_from_reasoning(reasoning)
                 if content:
                     _safe_print(
-                        f"[chat] MiMo content 空，从 reasoning 尾部提取 len={len(content)}",
+                        f"[chat] content 空，从 reasoning 尾部提取 len={len(content)}",
                         flush=True,
                     )
-                    self._debug_dump("MiMo extracted from reasoning", content, limit=2000)
             if not content:
-                _safe_print("[chat] MiMo 空 content → 本地兜底句", flush=True)
+                _safe_print("[chat] 空 content → 本地兜底句", flush=True)
                 return self._fallback_reply()
-        else:
-            self._debug_dump("MiMo final content", content, limit=2000)
+        return content
+
+    # <TTS>{...}</TTS> 元数据行约占 100-200 token，回复预算保留下限防截断。
+    _MIN_COMPLETION_TOKENS = 320
+
+    def _completion_token_budget(self) -> int:
+        try:
+            configured = int(getattr(self, "max_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        return max(configured, self._MIN_COMPLETION_TOKENS)
+
+    async def _chat_openai_compatible_async(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        default_base: str,
+        label: str,
+    ) -> str:
+        """云厂商 OpenAI 兼容请求（DeepSeek / MiMo 共用）。"""
+        import time as _time
+
+        msgs = messages if messages is not None else self.history
+        t0 = _time.time()
+        base_url = (getattr(self, "api_base", "") or default_base).rstrip("/")
+        url = f"{base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        api_key = getattr(self, "api_key", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        body = {
+            "model": self.model,
+            "messages": msgs,
+            "temperature": getattr(self, "temperature", 0.7),
+            "max_tokens": self._completion_token_budget(),
+        }
+        _safe_print(
+            f"[chat] {label} 请求(async): model={self.model} messages={len(msgs)}",
+            flush=True,
+        )
+        try:
+            resp = await self._post_json(
+                url,
+                headers=headers,
+                json_body=body,
+                timeout=(5, 120),
+            )
+        except Exception as e:
+            _safe_print(f"[chat] {label} async 异常: {type(e).__name__}", flush=True)
+            self._debug_dump(f"{label} exception", e)
+            return self._fallback_reply()
+
+        elapsed = _time.time() - t0
+        _safe_print(
+            f"[chat] {label} 响应: status={resp.status_code} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+        if resp.status_code != 200:
+            # 错误响应体可能回显对话内容，默认只记录状态码，正文仅调试转储
+            _safe_print(f"[chat] {label} HTTP {resp.status_code} → 本地兜底句", flush=True)
+            self._debug_dump(f"{label} error body", getattr(resp, "text", ""), limit=2000)
+            return self._fallback_reply()
+        try:
+            data = resp.json()
+        except Exception as e:
+            _safe_print(f"[chat] {label} JSON 解析失败: {type(e).__name__}", flush=True)
+            return self._fallback_reply()
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        content = self._mimo_message_text(message)
+        if not content:
+            reasoning = (message.get("reasoning_content") or "").strip()
+            if reasoning:
+                content = self._mimo_content_from_reasoning(reasoning)
+        if not content:
+            _safe_print(f"[chat] {label} 空 content → 本地兜底句", flush=True)
+            return self._fallback_reply()
+        return content
+
+    async def _chat_mimo_async(self, messages: List[Dict[str, str]] = None) -> str:
+        """MiMo OpenAI 兼容请求（content 为空时从 reasoning 弱兜底）。"""
+        return await self._chat_openai_compatible_async(
+            messages,
+            default_base="https://api.xiaomimimo.com/v1",
+            label="MiMo",
+        )
+
+    async def _chat_ollama_async(self, messages: List[Dict[str, str]] = None) -> str:
+        """Ollama 原生 /api/chat 请求（本地默认无鉴权）。"""
+        msgs = messages if messages is not None else self.history
+        host = (getattr(self, "host", "") or "http://127.0.0.1:11434").rstrip("/")
+        url = f"{host}/api/chat"
+        body = {
+            "model": self.model,
+            "messages": msgs,
+            "stream": False,
+            "options": {
+                "temperature": getattr(self, "temperature", 0.7),
+                "num_predict": self._completion_token_budget(),
+            },
+        }
+        try:
+            resp = await self._post_json(
+                url,
+                headers={"Content-Type": "application/json"},
+                json_body=body,
+                timeout=(5, 120),
+            )
+        except Exception as e:
+            _safe_print(f"[chat] Ollama async 异常: {type(e).__name__}", flush=True)
+            self._debug_dump("Ollama exception", e)
+            return self._fallback_reply()
+        if resp.status_code != 200:
+            _safe_print(f"[chat] Ollama HTTP {resp.status_code} → 本地兜底句", flush=True)
+            self._debug_dump("Ollama error body", getattr(resp, "text", ""), limit=2000)
+            return self._fallback_reply()
+        try:
+            data = resp.json()
+        except Exception:
+            return self._fallback_reply()
+        content = str(((data.get("message") or {}).get("content")) or "").strip()
+        if not content:
+            return self._fallback_reply()
         return content
 
     async def quick_chat_async(self, message: str) -> Tuple[str, str]:
@@ -911,23 +876,19 @@ class ChatEngine:
         每 3 条用户消息触发一次，用 LLM 做轻量提取。"""
         if not self.memory:
             return
-        # 用内存计数器
         if not hasattr(self, '_mem_extract_count'):
             self._mem_extract_count = 0
         self._mem_extract_count += 1
 
-        # 快速触发：用户消息含「记住」关键词时立即提取本轮
         quick_trigger = any(kw in user_msg for kw in ["记住", "记下", "别忘了", "提醒我"])
         if not quick_trigger and self._mem_extract_count < 3:
             return
         self._mem_extract_count = 0
 
-        # 取最近 6 条对话作为上下文
         recent = self.memory.get_recent_chats(6)
         if len(recent) < 4:
             return
 
-        # 构建提取 prompt
         context_lines = []
         for c in recent:
             role = "主人" if c["role"] == "user" else "梅尔"
@@ -972,43 +933,25 @@ class ChatEngine:
             self._debug_dump("memory extraction exception", e)
 
     def _send_extract_request(self, prompt: str) -> str:
-        """根据后端类型发送记忆提取请求，返回响应文本（空字符串表示失败）。"""
+        """统一使用 OpenAI 标准请求进行记忆提取"""
         from meapet.async_runtime import run as _arun
         from meapet.http_async import post_json
 
-        if self.backend == "ollama":
-            resp = _arun(
-                post_json(
-                    f"{self.host}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": 0.2,
-                            "num_predict": 200,
-                        },
-                    },
-                    timeout=30.0,
-                ),
-                timeout=45,
-            )
-            if resp.status_code != 200:
-                return ""
-            return resp.json().get("response", "")
+        base_url = (self.api_base or self.host or "http://127.0.0.1:11434").rstrip("/")
+        url = f"{base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
-        elif self.backend in ("deepseek", "mimo"):
-            extract_messages = [
-                {"role": "system", "content": "你是一个信息提取助手。从对话中提取值得长期记住的事实，每行一条用「- 」开头。如果没有值得记的内容回复「无」。"},
-                {"role": "user", "content": prompt},
-            ]
+        extract_messages = [
+            {"role": "system", "content": "你是一个信息提取助手。从对话中提取值得长期记住的事实，每行一条用「- 」开头。如果没有值得记的内容回复「无」。"},
+            {"role": "user", "content": prompt},
+        ]
+        try:
             resp = _arun(
                 post_json(
-                    f"{self.api_base.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    url,
+                    headers=headers,
                     json={
                         "model": self.model,
                         "messages": extract_messages,
@@ -1026,9 +969,8 @@ class ChatEngine:
                 return ""
             msg = choices[0].get("message") or {}
             return (msg.get("content") or "").strip()
-
-        _safe_print(f"[memory] 后端 {self.backend} 不支持记忆提取", flush=True)
-        return ""
+        except Exception:
+            return ""
 
     def _summarize_if_needed(self):
         """检查摘要触发器，调用 LLM 压缩旧对话为记忆片段"""
@@ -1074,8 +1016,8 @@ class ChatEngine:
 
 
 def create_engine_from_config(config: dict, memory: "MeaMemory" = None) -> ChatEngine:
-    """从配置文件创建引擎（api_key：环境变量优先于 config.json）"""
-    from meapet.config.store import resolve_direct_api_key
+    """从配置创建引擎：llm.direct 显式 profile 是运行时真源，旧顶层字段仅兜底。"""
+    from meapet.config.store import infer_direct_protocol, resolve_direct_api_key
 
     llm_cfg = config.get("llm", {})
     direct = (
@@ -1083,30 +1025,27 @@ def create_engine_from_config(config: dict, memory: "MeaMemory" = None) -> ChatE
         if isinstance(llm_cfg.get("direct"), dict)
         else {}
     )
-    backend = str(direct.get("provider") or llm_cfg.get("backend") or "ollama")
-    protocol = str(
-        direct.get("protocol")
-        or ("ollama_chat" if backend == "ollama" else "openai_chat")
-    )
     api_key = resolve_direct_api_key(llm_cfg)
 
-    model = direct.get("model") or llm_cfg.get("model") or "qwen3.5:4b"
+    model = direct.get("model") or llm_cfg.get("model") or "gpt-4o-mini"
     api_base = direct.get("api_base") or llm_cfg.get("api_base") or ""
     host = direct.get("host") or llm_cfg.get("host") or "http://127.0.0.1:11434"
-    if backend == "deepseek" and not api_base:
-        api_base = "https://api.deepseek.com/v1"
-    if (backend or "").lower() == "mimo":
-        try:
-            from meapet.config.store import normalize_mimo_model_id
-            model = normalize_mimo_model_id(model, for_vision=False)
-        except Exception:
-            # 官方 API id，不是 HF 仓库名
-            if not model or model in ("mimo",) or str(model).startswith("XiaomiMiMo/"):
-                model = "mimo-v2.5"
-        if not api_base:
-            api_base = "https://api.xiaomimimo.com/v1"
+    protocol = str(direct.get("protocol") or "").strip().lower()
+    if not protocol:
+        protocol = infer_direct_protocol(
+            "custom",
+            api_base=api_base,
+            host=host,
+        )
+
+    _safe_print(
+        f"[DEBUG] create_engine_from_config: backend=custom, host={host}, "
+        f"api_base={api_base}, model={model}, protocol={protocol}",
+        flush=True,
+    )
     return ChatEngine(
-        backend=backend,
+        backend="custom",
+        protocol=protocol,
         host=host,
         model=model,
         api_key=api_key,
@@ -1114,16 +1053,24 @@ def create_engine_from_config(config: dict, memory: "MeaMemory" = None) -> ChatE
         temperature=direct.get("temperature", llm_cfg.get("temperature", 0.7)),
         memory=memory,
         bridge_url=llm_cfg.get("bridge_url", "http://127.0.0.1:18888"),
-        protocol=protocol,
         max_tokens=direct.get("max_tokens", llm_cfg.get("max_tokens", 4096)),
+        extra_headers=(
+            direct.get("headers") if isinstance(direct.get("headers"), dict) else {}
+        ),
+        timeout_seconds=direct.get("timeout_seconds", 0),
+        proxy=direct.get("proxy", ""),
+        thinking=(
+            direct.get("thinking") if isinstance(direct.get("thinking"), dict) else {}
+        ),
     )
 
 
 if __name__ == "__main__":
     engine = ChatEngine()
-    _safe_print(f"Backend: {engine.backend}, Model: {engine.model}, Available: {engine.available}")
+    _safe_print(f"Model: {engine.model}, Available: {engine.available}")
     _safe_print("=== 梅尔对话测试 ===")
     for msg in ["你好呀", "你最喜欢吃什么"]:
         reply, mood = engine.chat(msg)
         _safe_print(f"\n你: {msg}")
         _safe_print(f"梅尔 [{mood}]: {reply}")
+

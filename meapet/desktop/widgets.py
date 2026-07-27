@@ -39,7 +39,11 @@ from meapet.desktop.theme import DIALOG_STYLE, DIALOGUE_STYLE
 from meapet.ui_theme import (
     MIN_TARGET_SIZE,
     PALETTE,
+    PET_SIZE_FACTOR_MAX,
+    PET_SIZE_FACTOR_MIN,
+    PET_SIZE_FACTOR_STEP,
     ensure_application_fonts,
+    normalize_pet_size_factor,
     set_scaled_stylesheet,
 )
 from meapet.utils import safe_print, log_error
@@ -411,6 +415,8 @@ class DialogueBox(QWidget):
         self.text_label = QLabel()
         self.text_label.setObjectName("DialogueText")
         self.text_label.setAccessibleName("桌宠回复")
+        # 模型/Agent 返回的文本必须按纯文本渲染，防止富文本注入
+        self.text_label.setTextFormat(Qt.PlainText)
         self.text_label.setWordWrap(True)
         self.text_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.text_label.setContentsMargins(0, 0, 0, 0)
@@ -445,8 +451,28 @@ class DialogueBox(QWidget):
         self._opacity_animation.setEasingCurve(QEasingCurve.OutQuad)
 
         self.hide()
+        self._mouse_passthrough = False
+
+    def set_mouse_passthrough(self, enabled: bool) -> None:
+        """待机穿透时让气泡不抢鼠标；恢复后仍可点开完整回复。"""
+        enabled = bool(enabled)
+        self._mouse_passthrough = enabled
+        targets = [self, self._container, self.text_scroll, self.text_label]
+        try:
+            viewport = self.text_scroll.viewport()
+        except Exception:
+            viewport = None
+        if viewport is not None:
+            targets.append(viewport)
+        for widget in targets:
+            try:
+                widget.setAttribute(Qt.WA_TransparentForMouseEvents, enabled)
+            except Exception:
+                pass
 
     def eventFilter(self, watched, event):
+        if getattr(self, "_mouse_passthrough", False):
+            return super().eventFilter(watched, event)
         if (
             event.type() == QEvent.MouseButtonRelease
             and event.button() == Qt.LeftButton
@@ -835,18 +861,19 @@ class DialogueBubbleStack(QObject):
 
 
 class SizeScaleDialog(QDialog):
-    """立绘大小调节对话框 — 滑块实时预览"""
+    """桌宠窗口大小调节对话框 — 滑块实时预览"""
     def __init__(self, current_factor: float, pet=None):
         super().__init__(pet)
         ensure_application_fonts()
         self._pet = pet
-        self._factor = current_factor
-        self._original = current_factor  # 取消时还原
-        self.setWindowTitle("调节立绘大小")
+        self._factor = normalize_pet_size_factor(current_factor)
+        self._original = self._factor  # 取消时还原
+        current_factor = self._factor
+        self.setWindowTitle("调节窗口大小")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(360, 200)
-        self.setAccessibleName("调节立绘大小")
+        self.setAccessibleName("调节窗口大小")
         set_scaled_stylesheet(self, DIALOG_STYLE)
 
         container = QFrame(self)
@@ -857,18 +884,22 @@ class SizeScaleDialog(QDialog):
         c_layout.setSpacing(12)
 
         # 百分比标签
-        self._pct_label = QLabel(f"{int(current_factor * 100)}%", self)
+        self._pct_label = QLabel(f"{round(current_factor * 100)}%", self)
         self._pct_label.setObjectName("ScaleValue")
-        self._pct_label.setAccessibleName("当前立绘缩放比例")
+        self._pct_label.setAccessibleName("当前窗口缩放比例")
         self._pct_label.setAlignment(Qt.AlignCenter)
 
         # 滑块 (30%–300%)
         self._slider = QSlider(Qt.Horizontal, self)
         self._slider.setObjectName("ScaleSlider")
-        self._slider.setRange(30, 300)
-        self._slider.setValue(int(current_factor * 100))
+        self._slider.setRange(
+            round(PET_SIZE_FACTOR_MIN * 100),
+            round(PET_SIZE_FACTOR_MAX * 100),
+        )
+        self._slider.setSingleStep(round(PET_SIZE_FACTOR_STEP * 100))
+        self._slider.setValue(round(current_factor * 100))
         self._slider.setMinimumHeight(MIN_TARGET_SIZE)
-        self._slider.setAccessibleName("立绘缩放比例")
+        self._slider.setAccessibleName("窗口缩放比例")
         self._slider.setAccessibleDescription("可在百分之三十到百分之三百之间调节")
         self._slider.valueChanged.connect(self._on_slider)
 
@@ -877,16 +908,16 @@ class SizeScaleDialog(QDialog):
         btn_layout.setSpacing(8)
         reset_btn = QPushButton("重置", self)
         reset_btn.setMinimumHeight(MIN_TARGET_SIZE)
-        reset_btn.setAccessibleName("重置立绘大小")
+        reset_btn.setAccessibleName("重置窗口大小")
         reset_btn.clicked.connect(self._reset)
         ok_btn = QPushButton("确定", self)
         ok_btn.setObjectName("PrimaryButton")
         ok_btn.setMinimumHeight(MIN_TARGET_SIZE)
-        ok_btn.setAccessibleName("应用立绘大小")
+        ok_btn.setAccessibleName("应用窗口大小")
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("取消", self)
         cancel_btn.setMinimumHeight(MIN_TARGET_SIZE)
-        cancel_btn.setAccessibleName("取消立绘大小调整")
+        cancel_btn.setAccessibleName("取消窗口大小调整")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(reset_btn)
         btn_layout.addStretch()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -67,9 +67,16 @@ class DirectProtocolConfig:
     protocol: str
     base_url: str
     api_key: str = ""
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 300.0
     verify_tls: bool = True
     ca_file: str = ""
+    # 供应商自定义请求头（如 OpenRouter 的 HTTP-Referer / 网关要求的额外头）。
+    # 与协议自带的鉴权头合并，但不允许覆盖鉴权与 Content-Type（见 _with_extra_headers）。
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
+    # 仅对该供应商生效的 HTTP(S) 代理，如 http://127.0.0.1:7890。
+    proxy: str = ""
+    # Anthropic 扩展思考配置：{"type": "adaptive"|"enabled"|"", "budget": int, "effort": str}
+    thinking: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         protocol = str(self.protocol or "").strip().lower()
@@ -140,6 +147,7 @@ class _SseEvent:
 async def _iter_sse(response: httpx.Response) -> AsyncIterator[_SseEvent]:
     event_name = "message"
     data_lines: list[str] = []
+    raw_line_count = 0
     async for line in response.aiter_lines():
         if line == "":
             if data_lines:
@@ -149,16 +157,52 @@ async def _iter_sse(response: httpx.Response) -> AsyncIterator[_SseEvent]:
             continue
         if line.startswith(":"):
             continue
-        field_name, separator, value = line.partition(":")
-        if not separator:
-            continue
-        value = value[1:] if value.startswith(" ") else value
-        if field_name == "event":
-            event_name = value or "message"
-        elif field_name == "data":
+        # 原始 SSE 帧可能含 reasoning/对话；仅 MEAPET_DEBUG=1 时输出
+        if raw_line_count < 20:
+            from meapet.utils import debug_enabled
+            if debug_enabled():
+                log.track(
+                    lambda l=line, n=raw_line_count: (
+                        f"[sse] raw line #{n}: "
+                        f"first_500={l[:500]!r}"
+                    )
+                )
+            raw_line_count += 1
+        if line.startswith("data:"):
+            value = line[5:].lstrip()
             data_lines.append(value)
+        elif line.startswith("event:"):
+            event_name = line[6:].strip() or "message"
+        elif line.startswith("id:"):
+            pass  # event id 暂不处理
+        elif line.startswith("{") or line.startswith("["):
+            # 非标准格式：纯 JSON 行（无 data: 前缀），直接作为 data
+            data_lines.append(line)
     if data_lines:
         yield _SseEvent(event_name, "\n".join(data_lines))
+
+
+async def _iter_sse_with_timeout(
+    response: httpx.Response,
+    *,
+    event_timeout: float = 60.0,
+) -> AsyncIterator[_SseEvent]:
+    """包装 _iter_sse，对每个事件设独立超时。超时后静默结束流。"""
+    it = _iter_sse(response).__aiter__()
+    while True:
+        try:
+            sse = await asyncio.wait_for(
+                it.__anext__(),
+                timeout=event_timeout,
+            )
+            yield sse
+        except asyncio.TimeoutError:
+            log.info(
+                f"[direct] SSE 事件超时 ({event_timeout:.0f}s)，视为流结束"
+            )
+            return
+        except StopAsyncIteration:
+            return
 
 
 def _http_error(status_code: int) -> DirectProtocolError:
@@ -323,11 +367,14 @@ def _ollama_spec(
         "model": request.model,
         "messages": _ollama_messages(request),
         "stream": request.stream,
-        "keep_alive": "30s",
+        "keep_alive": "5m",
         "think": False,
         "options": {
             "temperature": request.temperature,
             "num_predict": request.max_tokens,
+            "num_ctx": 8192,
+            "top_p": 0.85,
+            "repeat_penalty": 1.1,
         },
     }
     if request.response_format is not None:
@@ -372,6 +419,38 @@ def _responses_spec(
     )
 
 
+# Anthropic 扩展思考的最小预算（接口要求 >= 1024）。
+_ANTHROPIC_MIN_THINKING_BUDGET = 1024
+_ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "max"})
+
+
+def _anthropic_thinking_payload(
+    thinking: Mapping[str, object],
+) -> Optional[dict[str, object]]:
+    """把配置里的思考设置翻译成 Anthropic 请求体的 thinking 字段。
+
+    - type=adaptive：自适应思考，可带 effort（low/medium/high/max）。
+    - 未指定 type 但给了 budget：按手动预算模式，budget_tokens 须 >= 1024。
+    - 其余情况返回 None（不发送 thinking 字段）。
+    """
+    if not thinking:
+        return None
+    kind = str(thinking.get("type") or "").strip().lower()
+    if kind == "adaptive":
+        payload: dict[str, object] = {"type": "adaptive"}
+        effort = str(thinking.get("effort") or "").strip().lower()
+        if effort in _ANTHROPIC_EFFORTS:
+            payload["effort"] = effort
+        return payload
+    try:
+        budget = int(thinking.get("budget") or 0)
+    except (TypeError, ValueError):
+        return None
+    if kind in ("", "enabled") and budget >= _ANTHROPIC_MIN_THINKING_BUDGET:
+        return {"type": "enabled", "budget_tokens": budget}
+    return None
+
+
 def _anthropic_spec(
     config: DirectProtocolConfig,
     request: CanonicalChatRequest,
@@ -397,6 +476,11 @@ def _anthropic_spec(
         "max_tokens": request.max_tokens,
         "stream": request.stream,
     }
+    thinking = _anthropic_thinking_payload(config.thinking)
+    if thinking is not None:
+        body["thinking"] = thinking
+        # 开启扩展思考时 temperature 必须为默认值，否则接口报 400。
+        body.pop("temperature", None)
     body.update(request.extra)
     headers = {
         "Accept": "text/event-stream",
@@ -420,6 +504,27 @@ _SPEC_BUILDERS = {
     "anthropic_messages": _anthropic_spec,
 }
 
+# 自定义头不得篡改鉴权与协议语义（否则一个配置错误就会把密钥发错地方，
+# 或让 SSE 解析失败）。这些头只能由协议自身决定。
+_PROTECTED_HEADERS = frozenset(
+    {"authorization", "x-api-key", "anthropic-version", "content-type", "accept"}
+)
+
+
+def _with_extra_headers(
+    spec: _RequestSpec, extra: Mapping[str, str]
+) -> _RequestSpec:
+    """把供应商自定义头合并进请求；受保护的鉴权/协议头不可被覆盖。"""
+    if not extra:
+        return spec
+    merged = dict(spec.headers)
+    for key, value in extra.items():
+        name = str(key or "").strip()
+        if not name or name.lower() in _PROTECTED_HEADERS:
+            continue
+        merged[name] = str(value)
+    return _RequestSpec(spec.url, merged, spec.body, spec.stream_kind)
+
 
 class DirectProtocolClient:
     def __init__(
@@ -435,7 +540,8 @@ class DirectProtocolClient:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is not None:
             return self._client
-        if self.config.ca_file or not self.config.verify_tls:
+        # 代理是按供应商配置的，不能用进程级共享客户端，必须自持。
+        if self.config.ca_file or not self.config.verify_tls or self.config.proxy:
             if self._owned_client is None or self._owned_client.is_closed:
                 verify: object = self.config.verify_tls
                 if self.config.ca_file:
@@ -446,11 +552,15 @@ class DirectProtocolClient:
                             "模型接口 CA 证书文件不存在。",
                         )
                     verify = str(ca_path)
+                kwargs: dict[str, object] = {}
+                if self.config.proxy:
+                    kwargs["proxy"] = self.config.proxy
                 self._owned_client = httpx.AsyncClient(
                     timeout=httpx.Timeout(self.config.timeout_seconds, connect=10.0),
                     follow_redirects=True,
                     verify=verify,
                     headers={"User-Agent": "MeaPet/1.0"},
+                    **kwargs,
                 )
             return self._owned_client
         from meapet.http_async import get_client
@@ -527,7 +637,10 @@ class DirectProtocolClient:
         *,
         attempt: int = 1,
     ) -> AsyncIterator[object]:
-        spec = _SPEC_BUILDERS[self.config.protocol](self.config, request)
+        spec = _with_extra_headers(
+            _SPEC_BUILDERS[self.config.protocol](self.config, request),
+            self.config.extra_headers,
+        )
         client = await self._get_client()
         log.info(
             f"[direct] HTTP 发起 attempt={attempt}/{_NETWORK_RETRY_ATTEMPTS} "
@@ -554,10 +667,16 @@ class DirectProtocolClient:
                 text_chars = 0
                 if spec.stream_kind == "ollama_chat":
                     if "ndjson" not in content_type_l and "jsonl" not in content_type_l:
-                        raise DirectProtocolError(
-                            "protocol",
-                            "Ollama 未返回预期的 NDJSON 流。",
-                        )
+                        if "json" not in content_type_l:
+                            log.warning(
+                                f"[direct] Ollama 返回非预期 Content-Type: "
+                                f"{content_type}，将尝试按 NDJSON 解析"
+                            )
+                        else:
+                            log.info(
+                                f"[direct] Ollama 返回 Content-Type: {content_type}，"
+                                f"按 JSON Lines 处理"
+                            )
                     async for event in self._stream_ollama(response):
                         event_count += 1
                         if isinstance(event, TextDelta):
@@ -624,7 +743,7 @@ class DirectProtocolClient:
         response: httpx.Response,
     ) -> AsyncIterator[object]:
         done = False
-        async for sse in _iter_sse(response):
+        async for sse in _iter_sse_with_timeout(response):
             if sse.data.strip() == "[DONE]":
                 done = True
                 yield StreamDone()
@@ -638,16 +757,37 @@ class DirectProtocolClient:
                 delta = choice.get("delta")
                 if isinstance(delta, Mapping):
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    content = delta.get("content")
+                    # OpenAI Chat 兼容流中 reasoning 字段的处理策略：
+                    # 1. Ollama qwen3.5 等：content=""（空字符串），
+                    #    实际文本在 reasoning 中 → 兜底为 TextDelta。
+                    # 2. DeepSeek R1 等：content=None（key 缺失或 JSON null），
+                    #    reasoning_content 是思考过程 → 保持为 ReasoningDelta。
+                    if content is not None and not content and reasoning:
+                        content = reasoning
+                        reasoning = None
                     if isinstance(reasoning, str) and reasoning:
                         yield ReasoningDelta(reasoning)
-                    content = delta.get("content")
                     if isinstance(content, str) and content:
                         yield TextDelta(content)
+                # 部分 SSE 实现（如 Ollama）不发 [DONE]，只靠 finish_reason 标记结尾
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None and isinstance(finish_reason, str):
+                    log.track(
+                        lambda r=finish_reason: (
+                            f"[openai_chat] finish_reason={r} 提前终止 SSE 流"
+                        )
+                    )
+                    done = True
+                    yield StreamDone(finish_reason)
+                    break
             usage = payload.get("usage")
             if isinstance(usage, Mapping):
                 yield UsageEvent(dict(usage))
         if not done:
-            raise DirectProtocolError("protocol", "模型 SSE 流意外结束。")
+            # _iter_sse_with_timeout 超时返回或连接正常结束但无 [DONE] 标记
+            yield StreamDone("end")
+        await response.aclose()
 
     async def _stream_responses(
         self,
@@ -718,21 +858,50 @@ class DirectProtocolClient:
         response: httpx.Response,
     ) -> AsyncIterator[object]:
         done = False
+        lines_read = 0
+        error_lines = 0
         async for line in response.aiter_lines():
             if not line.strip():
                 continue
+            lines_read += 1
+            # 首行原始日志（带 data: 前缀等），用于诊断 SSE 与 NDJSON 格式混用
+            if lines_read <= 3:
+                log.track(
+                    lambda l=line: f"[ollama] raw line #{lines_read}: {l[:300]}"
+                )
+            if line.startswith("data:"):
+                line = line[5:].lstrip()
+                error_lines += 1
+                if error_lines <= 3:
+                    log.track(
+                        lambda l=line, n=error_lines: (
+                            f"[ollama] stripped data: prefix #{n}, "
+                            f"json_len={len(l)} first_100={l[:100]}"
+                        )
+                    )
             payload = self._decode_json(line)
             if payload.get("error"):
                 raise DirectProtocolError("backend", "Ollama 未能完成回复。")
             message = payload.get("message")
+            content_found = False
             if isinstance(message, Mapping):
                 thinking = message.get("thinking")
                 if isinstance(thinking, str) and thinking:
                     yield ReasoningDelta(thinking)
                 content = message.get("content")
+                # 部分模型可能把内容放在顶层 response 字段
+                if not content:
+                    content = payload.get("response")
                 if isinstance(content, str) and content:
+                    content_found = True
                     yield TextDelta(content)
             if bool(payload.get("done")):
+                log.track(
+                    lambda m=bool(message), c=content_found, l=lines_read: (
+                        f"[ollama] done=True lines={l} "
+                        f"has_message={m} has_content={c}"
+                    )
+                )
                 usage = {
                     key: payload[key]
                     for key in (
@@ -748,4 +917,16 @@ class DirectProtocolClient:
                 yield StreamDone(str(payload.get("done_reason") or ""))
                 break
         if not done:
+            # 读到了行但没有 done 标记 → 可能是非流式单行 JSON
+            if lines_read > 0:
+                log.info(
+                    "[direct] Ollama 流未含 done 标记，但已读取 "
+                    f"{lines_read} 行，视为完毕"
+                )
+                return
             raise DirectProtocolError("protocol", "Ollama NDJSON 流意外结束。")
+        log.track(
+            lambda l=lines_read, e=error_lines: (
+                f"[ollama] stream finished lines={l} data_prefix_lines={e}"
+            )
+        )

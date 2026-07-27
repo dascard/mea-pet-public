@@ -6,9 +6,9 @@ import shutil
 import threading
 import uuid
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QPoint, QRect, QSize, QTimer
 
-from meapet.utils import debug_enabled, log_error, redact_text
+from meapet.utils import log_error, redact_text
 from meapet.agent.base import (
     AgentTurnRequest,
     ToolStatus,
@@ -48,22 +48,55 @@ from meapet.desktop import status_language
 from meapet.desktop.audio import bubble_duration_for_audio
 from meapet.desktop.workers import AgentChatWorker, ChatWorker, TTSWorker
 from meapet.desktop.chat_input import ChatInputBox, set_awaiting_reply_state
+from meapet.desktop.screen_geometry import (
+    available_geometry_for,
+    calculate_popup_position,
+)
 from meapet.log import get_color_logger
 
 log = get_color_logger("chat_flow")
 
+# 消息编辑器与桌宠之间的间距。
+CHAT_INPUT_GAP = 20
+
 # 串行队列：确保记忆操作（摘要、提取等）不会并发执行
 _memory_op_lock = threading.Lock()
+
+
+def place_chat_input(host, composer) -> None:
+    """把消息编辑器贴到桌宠旁边，并保证完整落在屏幕可用区域内。
+
+    以编辑器实际尺寸居中，避免 UI 调整后仍依赖旧的硬编码宽度；桌宠贴边时优先
+    放上方，放不下再依次退让，最后夹进屏幕可用区域。
+    """
+    pet_rect = QRect(
+        QPoint(host.pos().x(), host.pos().y()),
+        QSize(host.width(), host.height()),
+    )
+    input_size = QSize(composer.width(), composer.height())
+    area = available_geometry_for(pet_rect)
+    if area is None:
+        position = QPoint(
+            pet_rect.x() + (pet_rect.width() - input_size.width()) // 2,
+            pet_rect.y() - input_size.height() - CHAT_INPUT_GAP,
+        )
+    else:
+        position = calculate_popup_position(
+            pet_rect,
+            input_size,
+            area,
+            placement="above",
+            gap=CHAT_INPUT_GAP,
+        )
+    composer.move(position)
 
 
 def _log_private_text(label: str, text: str, *, suffix: str = "") -> None:
     """默认仅记录文本长度；显式调试时才记录正文。"""
     value = str(text or "")
     tail = f" {suffix}" if suffix else ""
-    if debug_enabled():
-        log.debug(f"{label}: chars={len(value)}{tail}\n{value}")
-    else:
-        log.debug(f"{label}: chars={len(value)}{tail}")
+    log.track(lambda: f"{label}: chars={len(value)}{tail}\n{value}")
+    log.debug(f"{label}: chars={len(value)}{tail}")
 
 
 class PetChatFlowMixin:
@@ -80,10 +113,10 @@ class PetChatFlowMixin:
                 str(agent.get("session_id") or "pending"),
             )
         else:
-            direct = llm.get("direct") or {}
+            # 直连身份恒为 custom；不再用厂商品牌拆时间线。
             key = ConversationKey(
                 "direct",
-                str(direct.get("provider") or llm.get("backend") or "ollama"),
+                "custom",
                 "local",
             )
         self._conversation_key = key
@@ -231,15 +264,15 @@ class PetChatFlowMixin:
         if getattr(self, "_awaiting_reply", False):
             self._chat_input.set_busy(True, status_language.thinking_busy())
 
-        # 以编辑器实际尺寸居中，避免 UI 调整后仍依赖旧的硬编码宽度。
-        input_x = self.pos().x() + (self.width() - self._chat_input.width()) // 2
-        input_y = self.pos().y() - self._chat_input.height() - 20
-        if input_y < 30:
-            input_y = self.pos().y() + self.height() + 20
-
-        self._chat_input.move(max(0, input_x), max(0, input_y))
+        place_chat_input(self, self._chat_input)
         self._chat_input.text_submitted.connect(self._on_input_submit)
         self._chat_input.show()
+
+    def _place_chat_input(self) -> None:
+        """屏幕分辨率变化、桌宠被拉回可视范围后重新贴靠编辑器。"""
+        composer = getattr(self, "_chat_input", None)
+        if composer is not None:
+            place_chat_input(self, composer)
 
     def _on_input_submit(self, text: str):
         """用户提交了输入"""
@@ -428,9 +461,9 @@ class PetChatFlowMixin:
         self._last_user_msg = message
         _log_private_text("[chat] 发送给 LLM", message)
         mode = "agent" if self._is_agent_mode() else "direct"
+        # 正文只经 _log_private_text 的 TRACK 通道，默认日志仅记录长度
         log.info(
-            f"[chat] 请求发起 mode={mode} chars={len(message or '')} "
-            f"text={message}"
+            f"[chat] 请求发起 mode={mode} chars={len(message or '')}"
         )
 
         # 显示思考中提示
@@ -449,13 +482,13 @@ class PetChatFlowMixin:
         if hasattr(self, '_chat_poll'):
             self._chat_poll.stop()
 
-        # 超时保护（匹配 Ollama 读取超时 120s + 缓冲）
+        # 超时保护（匹配 HTTP 读取超时 300s + 缓冲）
         if hasattr(self, '_chat_timeout'):
             self._chat_timeout.stop()
         self._chat_timeout = QTimer(self)
         self._chat_timeout.setSingleShot(True)
         self._chat_timeout.timeout.connect(self._on_chat_timeout)
-        self._chat_timeout.start(130000)
+        self._chat_timeout.start(330000)
 
         try:
             self._chat_worker = self._make_chat_worker(message)
@@ -541,8 +574,13 @@ class PetChatFlowMixin:
                         if str(getattr(seg, "display_text", "") or "").strip()
                     )
                     if reply_text:
+                        # 回复正文不写入默认日志（文件日志保留 7 天），
+                        # 全文仅在 TRACK 级调试时输出
                         log.info(
-                            f"[reply] 模型返回文本 chars={len(reply_text)}\n{reply_text}"
+                            f"[reply] 模型返回文本 chars={len(reply_text)}"
+                        )
+                        log.track(
+                            lambda text=reply_text: f"[reply] 模型返回文本:\n{text}"
                         )
                 except Exception as exc:
                     log.debug(
@@ -869,8 +907,8 @@ class PetChatFlowMixin:
         if context is not None and not self._turn_context_is_current(context):
             return
         _log_private_text("[reply] LLM 回复", reply, suffix=f"mood={mood}")
-        # 控制台默认打印模型返回的可展示文本。
-        log.info(f"[reply] 收到回复 mood={mood} chars={len(reply or '')}\n{reply or ''}")
+        # 默认日志只记长度；正文走 _log_private_text 的 TRACK 通道
+        log.info(f"[reply] 收到回复 mood={mood} chars={len(reply or '')}")
         if hasattr(self, '_chat_timeout'):
             self._chat_timeout.stop()
         eng = getattr(self, "chat_engine", None)
@@ -1149,8 +1187,7 @@ class PetChatFlowMixin:
         wav_path = value.rsplit("|", 1)[0] if "|" in value else value
         if not wav_path or not os.path.exists(wav_path):
             log.warning(f"[audio] TTS 未生成有效文件，回退文字: chars={len(value)}")
-            if debug_enabled():
-                log.debug(f"[audio] 无效 TTS 返回: {raw!r}")
+            log.track(f"[audio] 无效 TTS 返回: {raw!r}")
             self._complete_pending_chat_reply()
             return
         self._complete_pending_chat_reply(wav_path)
@@ -1160,18 +1197,11 @@ class PetChatFlowMixin:
         if context is not None and not self._turn_context_is_current(context):
             return
         _log_private_text("[chat] 错误", err)
-        error_summary = (
-            redact_text(err)
-            if debug_enabled()
-            else f"error_chars={len(err or '')}"
-        )
-        log.error(f"[chat] 对话错误: {error_summary}")
+        err_len = len(err or "")
+        log.error(f"[chat] 对话错误: error_chars={err_len}")
+        log.track(lambda: f"[chat] 对话错误: error_chars={err_len} error_raw={redact_text(err)}")
         if hasattr(self, '_chat_timeout'):
             self._chat_timeout.stop()
-        log_error(
-            "pet_chat",
-            error_summary,
-        )
         timeline = getattr(self, "_conversation_timeline", None)
         key = (
             getattr(context, "conversation_key", None)
@@ -1199,7 +1229,14 @@ class PetChatFlowMixin:
         context = getattr(self, "_active_turn_context", None)
         if context is not None and not self._turn_context_is_current(context):
             return
-        log.warning("[chat] ChatWorker 超时，释放锁")
+        worker = getattr(self, '_chat_worker', None)
+        engine = getattr(self, 'chat_engine', None)
+        backend = getattr(engine, 'backend', '?')
+        model = getattr(engine, 'model', '?')
+        log.warning(
+            f"[chat] ChatWorker 超时 backend={backend} model={model} "
+            f"worker_alive={worker is not None and worker.isRunning()}"
+        )
         set_awaiting_reply_state(self, False)
         self._show_bubble(status_language.chat_timeout(), 3000)
         self._position_bubble()

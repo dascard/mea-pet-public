@@ -1,7 +1,6 @@
-"""依赖安装 / 下载 / Ollama 辅助"""
+"""Dependency install and download utilities."""
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -11,15 +10,20 @@ import urllib.request
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-class WorkerSignals(QObject):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
+
+def _is_frozen() -> bool:
+    """Check if running in a PyInstaller-frozen environment."""
+    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
 
 def pip_install(packages: list) -> bool:
-    """安装 Python 包，返回是否成功"""
+    """Install Python packages. Returns True on success.
+
+    In frozen mode (PyInstaller) ``sys.executable`` is the pet exe, not a
+    real Python interpreter — pip invocations always fail.
+    """
+    if _is_frozen():
+        return False
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install"] + packages,
@@ -31,7 +35,11 @@ def pip_install(packages: list) -> bool:
 
 
 def check_installed(package: str) -> bool:
-    """检查 Python 包是否已安装（兼容包名与 import 名差异）"""
+    """Check if a Python package is installed (handles name-vs-import differences).
+
+    In frozen mode the subprocess-based fallback is skipped to avoid
+    spawning a duplicate MeaPet instance.
+    """
     import_aliases = {
         "pywin32": ("win32api", "win32gui", "pythoncom"),
         "live2d-py": ("live2d",),
@@ -50,6 +58,8 @@ def check_installed(package: str) -> bool:
             return True
         except ImportError:
             continue
+    if _is_frozen():
+        return False  # skip subprocess fallback in frozen mode
     try:
         subprocess.run(
             [sys.executable, "-m", "pip", "show", package],
@@ -129,48 +139,6 @@ def download_file(url: str, dest: str, progress_callback=None):
                 os.remove(temp_path)
             except OSError:
                 pass
-
-
-def check_ollama_running():
-    """检查 Ollama 是否在运行"""
-    try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read())
-                models = [m["name"] for m in data.get("models", [])]
-                return True, models
-        return False, []
-    except Exception:
-        return False, []
-
-
-def check_ollama_installed():
-    """检查 Ollama 是否已安装（看能不能找到 ollama 命令）"""
-    try:
-        subprocess.run(["ollama", "--version"], capture_output=True, timeout=5)
-        return True
-    except Exception:
-        return False
-
-
-def pull_ollama_model(model: str, log_callback=None):
-    """拉取 Ollama 模型"""
-    try:
-        proc = subprocess.Popen(
-            ["ollama", "pull", model],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
-        )
-        for line in proc.stdout:
-            if log_callback:
-                log_callback(line.strip())
-        proc.wait()
-        return proc.returncode == 0
-    except Exception as e:
-        if log_callback:
-            log_callback(f"错误：{e}")
-        return False
 
 
 # ═══════════════════════════════════════

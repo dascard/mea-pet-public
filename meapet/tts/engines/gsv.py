@@ -1,17 +1,22 @@
-"""TTS 引擎 mixin（从 tts.py 拆出）"""
+"""TTS engine mixin (extracted from tts.py)."""
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import time
 from typing import Optional
 
 from meapet.config.normalizers import normalize_gsv_ref_language
 from meapet.paths import project_root
 from meapet.log import get_color_logger
-from meapet.utils import debug_enabled
-from meapet.tts.common import LANG_TTS, MOOD_TO_REF
+from meapet.tts.common import (
+    LANG_TTS,
+    MOOD_TO_REF,
+    hidden_subprocess_kwargs,
+    resolve_external_python,
+)
 
 log = get_color_logger("tts")
 
@@ -37,7 +42,18 @@ class TtsGsvMixin:
     def _speak_gsv(self, tts_text: str, output_wav: str, mood: str,
                     ref_wav: str, ref_text: str, ref_lang: str,
                     text_lang: str | None = None) -> Optional[tuple[str, str]]:
-        """GPT-SoVITS 后端推理（原逻辑）"""
+        """GPT-SoVITS backend inference.
+
+        Requires a real external Python runtime. Never launches MeaPet.exe.
+        """
+        python_exe = resolve_external_python(getattr(self, "python_exe", None))
+        if not python_exe:
+            log.warning(
+                "No real Python interpreter for GSV inference. "
+                "Skipping local GSV; use in-process VITS or MiMo cloud TTS."
+            )
+            return None, ""
+        self.python_exe = python_exe
         reference_language = _gsv_language_label(ref_lang)
         synthesis_language = _gsv_language_label(text_lang or ref_lang)
         # 获取参考音频
@@ -75,6 +91,7 @@ class TtsGsvMixin:
                 capture_output=True,
                 timeout=self.timeout,
                 cwd=project_root(),
+                **hidden_subprocess_kwargs(),
             )
             elapsed = time.time() - t1
             # 用 replace 忽略无法解码的字节（GPT-SoVITS 可能会输出 GBK 编码的中文日志）
@@ -84,13 +101,12 @@ class TtsGsvMixin:
             log.info(f"子进程返回 (rc={proc.returncode}, {elapsed:.1f}s)")
             if stderr_text.strip():
                 log.warning(f"stderr chars={len(stderr_text.strip())}")
-                if debug_enabled():
-                    log.debug(f"stderr [debug]: {stderr_text.strip()[-200:]}")
+                log.track(lambda: f"stderr [debug]: {stderr_text.strip()[-200:]}")
 
             if proc.returncode != 0:
                 log.error(f"TTS subprocess failed: rc={proc.returncode}")
-                if stderr_text.strip() and debug_enabled():
-                    log.debug(f"stderr [debug]: {stderr_text[:300]}")
+                if stderr_text.strip():
+                    log.track(lambda: f"stderr [debug]: {stderr_text[:300]}")
                 return None, ""
 
             # 取最后一行非空 JSON
@@ -104,13 +120,11 @@ class TtsGsvMixin:
             if not result.get("ok"):
                 err = result.get('error', 'unknown')
                 log.error(f"TTS subprocess error chars={len(str(err))}")
-                if debug_enabled():
-                    log.debug(f"TTS subprocess error [debug]: {err}")
+                log.track(lambda: f"TTS subprocess error [debug]: {err}")
                 if result.get("captured"):
                     captured = str(result["captured"])
                     log.warning(f"captured chars={len(captured)}")
-                    if debug_enabled():
-                        log.debug(f"captured [debug]: {captured[:300]}")
+                    log.track(lambda: f"captured [debug]: {captured[:300]}")
                 return None, ""
 
             duration = result.get("duration", 0)
@@ -123,14 +137,13 @@ class TtsGsvMixin:
             return None, ""
         except json.JSONDecodeError as e:
             log.error(f"TTS JSON parse error: {type(e).__name__}")
-            if 'last_line' in locals() and debug_enabled():
-                log.debug(f"  last_line [debug]: {last_line[:200]}")
+            if 'last_line' in locals():
+                log.track(lambda: f"  last_line [debug]: {last_line[:200]}")
             return None, ""
         except Exception as e:
             log.error(f"TTS subprocess error: {type(e).__name__}")
             import traceback
-            if debug_enabled():
-                log.debug(traceback.format_exc())
+            log.track(lambda: traceback.format_exc())
             return None, ""
 
     def _get_ref_paths(

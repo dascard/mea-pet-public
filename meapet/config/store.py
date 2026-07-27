@@ -16,6 +16,7 @@ import copy
 import json
 import os
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -24,29 +25,174 @@ from meapet.config.normalizers import (
     canonical_tts_language,
     normalize_gsv_ref_language,
 )
+from meapet.config import providers as _providers
 from meapet.ui_theme import normalize_ui_font_scale
+from meapet.ui_theme import normalize_pet_size_factor, normalize_ui_font_scale
 from meapet.utils import mask_secret, normalize_watcher
 from meapet.vision.policy import normalize_vision_mode
 
 
-# backend / 字段 → 候选环境变量（按顺序）
-ENV_LLM_KEY = {
+# 通用 LLM 环境变量（未知/未标注 backend 时的兜底）。
+# MEAPET_API_KEY 是跨后端的通用兜底；厂商专属变量见 URL 探测。
+ENV_LLM_KEY = ("OPENAI_API_KEY", "MEAPET_API_KEY")
+# 仅作 URL 级 env 探测复用；direct.provider 一律保存为 custom。
+ENV_LLM_KEY_BY_FAMILY = {
     "deepseek": ("DEEPSEEK_API_KEY", "MEAPET_API_KEY"),
     "mimo": ("MIMO_API_KEY", "XIAOMIMIMO_API_KEY", "MEAPET_API_KEY"),
-    "ollama": (),
-    "openclaw": (),
+    "openai": ("OPENAI_API_KEY", "MEAPET_API_KEY"),
+    "anthropic": ("ANTHROPIC_API_KEY", "MEAPET_API_KEY"),
 }
-
-ENV_TTS_KEY = ("MIMO_API_KEY", "XIAOMIMIMO_API_KEY")
-# 仅用于读取/脱敏旧配置；当前 TTS 翻译服务不再需要密钥。
+# 旧名兼容：部分测试/调用仍引用 BY_BACKEND。
+ENV_LLM_KEY_BY_BACKEND = ENV_LLM_KEY_BY_FAMILY
+ENV_TTS_KEY = ("MIMO_API_KEY", "XIAOMIMIMO_API_KEY", "MEAPET_API_KEY")
 ENV_TRANSLATE_KEY = ("TRANSLATE_API_KEY",)
-ENV_VISION_KEY = ENV_LLM_KEY["mimo"]
+ENV_VISION_KEY = ("MIMO_API_KEY", "XIAOMIMIMO_API_KEY", "MEAPET_API_KEY")
 
-SUPPORTED_VISION_BACKENDS = {"ollama", "mimo"}
+# 直连协议默认；显式 protocol 始终优先。provider 品牌不再参与分流。
+PROTOCOL_BY_ENDPOINT_FAMILY = {
+    "ollama": "ollama_chat",
+    "mimo": "openai_chat",
+    "anthropic": "anthropic_messages",
+    "deepseek": "openai_chat",
+    "openai": "openai_chat",
+    "custom": "openai_chat",
+}
+# 旧名：历史代码/测试可能仍 import。
+PROTOCOL_BY_PROVIDER = PROTOCOL_BY_ENDPOINT_FAMILY
+
+# 从 providers 预设注册表补齐新供应商的协议与密钥环境变量映射（单一数据源）。
+# 用 setdefault：不覆盖上面已有的 5 个内置 family（保持既有行为）。
+for _preset in _providers.all_presets():
+    PROTOCOL_BY_ENDPOINT_FAMILY.setdefault(_preset.id, _preset.protocol)
+    if _preset.env_keys:
+        ENV_LLM_KEY_BY_FAMILY.setdefault(_preset.id, _preset.family_env_keys)
+
+_DIRECT_PROVIDERS = frozenset({"custom"})
+# 旧顶层 backend 属于 Agent 类时，无 mode 配置迁去 agent。
+_AGENT_KINDS = frozenset({"hermes", "openclaw"})
+# 支持独立识图解析的视觉后端（vision.backend，不是 llm.provider）。
+_VISION_BACKENDS = frozenset({"ollama", "mimo"})
+
+# 默认 OpenAI 兼容地址（vision 等路径的公共 fallback）
+DEFAULT_API_BASE = "https://api.openai.com/v1"
+# Ollama 本地默认地址（host 形式，不带 /v1）
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+# MiMo 云端默认地址
 DEFAULT_MIMO_API_BASE = "https://api.xiaomimimo.com/v1"
 
 _ENV_PLACEHOLDERS = ("", "$ENV", "${ENV}", "env", "ENV")
+
+
+def _endpoint_family_from_text(text: object) -> str:
+    """对单个地址字符串做能力族识别；空串或未识别返回 ""。"""
+    value = str(text or "").strip().lower()
+    if not value:
+        return ""
+    if "xiaomimimo" in value or "mimo.mi.com" in value:
+        return "mimo"
+    if "anthropic" in value:
+        return "anthropic"
+    if "deepseek" in value:
+        return "deepseek"
+    # 预设注册表里的其余供应商（moonshot / zhipu / qwen / groq / lmstudio 等）。
+    # 放在 loopback 判定之前：LM Studio 这类本地 OpenAI 兼容服务的地址签名更具体，
+    # 不应被下面宽泛的 localhost→ollama 规则吞掉。ollama 仍走既有弱信号逻辑。
+    _preset_hit = _providers.detect_preset_by_url(value)
+    if _preset_hit is not None and _preset_hit.id != "ollama":
+        return _preset_hit.id
+    if "11434" in value or "localhost" in value or "127.0.0.1" in value:
+        return "ollama"
+    if "openai.com" in value:
+        return "openai"
+    return ""
+
+
+def detect_endpoint_family(*parts: object) -> str:
+    """从 API 地址识别能力族（仅用于协议/密钥/联动，不写入 provider）。
+
+    按参数优先级逐个判断，不拼接：云厂商命中立即返回；loopback/ollama
+    信号最弱，不能压过前面已出现的非空自定义 api_base（否则 ChatEngine
+    默认 host=127.0.0.1:11434 会把所有云端 endpoint 误判成 ollama）。
+
+    返回: ollama | mimo | deepseek | anthropic | openai | ""
+    """
+    saw_unrecognized = False
+    ollama_fallback = ""
+    for part in parts:
+        text = str(part or "").strip()
+        if not text:
+            continue
+        family = _endpoint_family_from_text(text)
+        if family == "ollama":
+            if not ollama_fallback:
+                ollama_fallback = "ollama"
+            continue
+        if family:
+            return family
+        # 非空但未识别（自定义 OpenAI 兼容地址等）：保留为强于默认 host 的信号
+        saw_unrecognized = True
+    if saw_unrecognized:
+        return ""
+    return ollama_fallback
+
+
+def normalize_direct_provider(provider: object = None) -> str:
+    """对话直连身份标签：始终 custom。厂商品牌不是传输后端。"""
+    return "custom"
+
+
+def infer_direct_protocol(
+    provider: object = None,
+    api_base: object = "",
+    host: object = "",
+) -> str:
+    """按端点地址推断直连协议；显式 protocol 由调用方优先保留。
+
+    provider 参数保留仅为旧调用兼容，不再参与分流。
+    """
+    family = detect_endpoint_family(api_base, host)
+    if family:
+        return PROTOCOL_BY_ENDPOINT_FAMILY.get(family, "openai_chat")
+    # 旧配置可能只剩 provider 标签、地址为空：尽量从标签兜底协议。
+    legacy = str(provider or "").strip().lower()
+    if legacy in PROTOCOL_BY_ENDPOINT_FAMILY:
+        return PROTOCOL_BY_ENDPOINT_FAMILY[legacy]
+    return "openai_chat"
+
+
+def _env_names_for_api_base(api_base: object, host: object = "") -> Tuple[str, ...]:
+    """URL 级环境变量提示：custom provider 仍可读厂商专属 key。"""
+    family = detect_endpoint_family(api_base, host)
+    if family in ENV_LLM_KEY_BY_FAMILY:
+        return ENV_LLM_KEY_BY_FAMILY[family]
+    return ()
+
+
+def llm_endpoint_family(llm_cfg: Optional[dict] = None) -> str:
+    """从 llm/direct 配置识别端点能力族。
+
+    优先看 api_base/host；旧配置仅有 provider/backend 标签时再回落标签。
+    """
+    llm = llm_cfg or {}
+    direct = llm.get("direct") if isinstance(llm.get("direct"), dict) else {}
+    # api_base 优先于 legacy host，避免默认 127.0.0.1:11434 覆盖云端地址
+    family = detect_endpoint_family(
+        direct.get("api_base"),
+        llm.get("api_base"),
+        direct.get("host"),
+        llm.get("host"),
+    )
+    if family:
+        return family
+    for raw in (
+        direct.get("provider"),
+        llm.get("backend"),
+        llm.get("provider"),
+    ):
+        key = str(raw or "").strip().lower()
+        if key in {"mimo", "ollama", "deepseek", "anthropic", "openai"}:
+            return key
+    return ""
 
 DEFAULT_BUBBLE = {
     "default": 5000,
@@ -70,6 +216,16 @@ DEFAULT_AGENT_CONTROL = {
     "ca_file": "",
 }
 
+# Live2D 顶层窗椭圆 mask：比例相对当前窗口宽高，随 size_factor 自动缩放。
+# 默认值来自实测微调后的贴合参数。
+DEFAULT_LIVE2D_WINDOW_MASK = {
+    "enabled": True,
+    "cx": 0.54,
+    "cy": 0.40,
+    "rw": 0.29,
+    "rh": 0.40,
+}
+
 
 def project_root() -> str:
     from meapet.paths import project_root as _pr
@@ -77,13 +233,38 @@ def project_root() -> str:
 
 
 def config_path(name: str = "config.json") -> str:
+    """返回配置文件路径。
+
+    在 PyInstaller 打包模式下使用 ``sys._MEIPASS``
+    （即 ``dist/MeaPet/_internal/``），配置与运行库在一起，
+    整个 dist/ 文件夹可以整体分发便携版。
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return str(Path(sys._MEIPASS) / name)
     return os.path.join(project_root(), name)
 
 
 def resolve_startup_config_path(
     root: Optional[Union[str, os.PathLike[str]]] = None,
 ) -> str:
-    """返回与当前工作目录无关的启动配置路径。"""
+    """返回与当前工作目录无关的启动配置路径。
+
+    搜索顺序（仅打包模式）：
+    1. ``_MEIPASS / config.json``（用户保存的配置）
+    2. ``_MEIPASS / config.example.json``（内置默认配置）
+
+    开发模式下：
+    1. ``root / config.json``
+    2. ``root / config.example.json``
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass = Path(sys._MEIPASS)
+        user_cfg = meipass / "config.json"
+        if user_cfg.is_file():
+            return str(user_cfg)
+        return str(meipass / "config.example.json")
+
+    # 开发模式
     base = Path(root) if root is not None else Path(project_root())
     primary = base / "config.json"
     if primary.is_file():
@@ -97,9 +278,13 @@ def resolve_writable_config_path(
 ) -> str:
     """把启动/读取路径映射为可写的 config.json。
 
-    从 config.example.json 启动时，首次保存必须落到同目录 config.json，
-    避免改写仓库模板。
+    从 config.example.json 启动时，首次保存必须落到 ``_MEIPASS``
+    （即 ``dist/MeaPet/_internal/config.json``），
+    与内置运行库在一起，整体便携分发。
     """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return str(Path(sys._MEIPASS) / "config.json")
+
     base = Path(root) if root is not None else Path(project_root())
     if path is None or str(path).strip() == "":
         return str(base / "config.json")
@@ -137,42 +322,6 @@ def _first_env(names: Tuple[str, ...]) -> str:
     return ""
 
 
-
-
-# 小米官方 API model id（不要用 HuggingFace 仓库名 XiaomiMiMo/...）
-# 文档: https://mimo.mi.com/docs/en-US/quick-start/summary/model
-MIMO_MODEL_ALIASES = {
-    "xiaomimimo/mimo-v2.5": "mimo-v2.5",
-    "xiaomimimo/mimo-v2.5-pro": "mimo-v2.5-pro",
-    "mimo-v2.5": "mimo-v2.5",
-    "mimo-v2.5-pro": "mimo-v2.5-pro",
-    "mimo": "mimo-v2.5",
-    "minicpm-v": "mimo-v2.5",  # 误填时给 vision 一条生路
-    "qwen3.5:4b": "mimo-v2.5",  # 同上
-}
-
-def normalize_mimo_model_id(model: str, *, for_vision: bool = False) -> str:
-    """把常见错误/别名映射成官方 API model id。
-
-    默认使用多模态 `mimo-v2.5`（对话/识图通用）。
-    仅当用户显式写 pro 相关名字时才映射到 `mimo-v2.5-pro`。
-    """
-    raw = (model or "").strip()
-    if not raw:
-        return "mimo-v2.5"
-    key = raw.lower()
-    if key in MIMO_MODEL_ALIASES:
-        return MIMO_MODEL_ALIASES[key]
-    # HF 风格: XiaomiMiMo/MiMo-V2.5 / XiaomiMiMo/MiMo-V2.5-Pro
-    if "mimo-v2.5-pro" in key or "mimo_v2.5_pro" in key or "mimo-v2.5pro" in key:
-        return "mimo-v2.5-pro"
-    if "mimo-v2.5" in key or "mimo_v2.5" in key or key.endswith("mimo-v2.5"):
-        return "mimo-v2.5"
-    if raw.startswith("XiaomiMiMo/") or raw.startswith("xiaomimimo/"):
-        # HF 仓库名默认落到多模态基座，不默认 pro
-        return "mimo-v2.5"
-    return raw
-
 def resolve_secret(file_value: str = "", env_names: Tuple[str, ...] = ()) -> str:
     env_val = _first_env(env_names)
     raw = (file_value or "").strip()
@@ -199,29 +348,62 @@ def save_config(config: dict, path: Optional[str] = None) -> None:
     save_json(cpath, normalize_config(merged))
 
 
+def _llm_env_names(backend: object) -> Tuple[str, ...]:
+    """按端点族选择可用的环境变量集合，避免跨厂商误用密钥。"""
+    key = str(backend or "").strip().lower()
+    return ENV_LLM_KEY_BY_FAMILY.get(key, ENV_LLM_KEY)
+
 
 def resolve_llm_api_key(llm_cfg: dict) -> str:
-    backend = (llm_cfg.get("backend") or "ollama").lower()
-    names = ENV_LLM_KEY.get(backend, ("MEAPET_API_KEY",))
-    return resolve_secret(llm_cfg.get("api_key", ""), names)
+    """解析 LLM API Key，优先 agent.api_key > llm.api_key > env。"""
+    agent = llm_cfg.get("agent") if isinstance(llm_cfg.get("agent"), dict) else {}
+    agent_key = resolve_secret(agent.get("api_key", ""), ENV_LLM_KEY)
+    if agent_key:
+        return agent_key
+    return resolve_secret(llm_cfg.get("api_key", ""), ENV_LLM_KEY)
 
 
 def resolve_direct_api_key(llm_cfg: dict) -> str:
-    """解析显式 direct profile；环境变量仍优先于文件值。"""
+    """解析显式 direct profile；环境变量仍优先于文件值。
+
+    provider 一律视为 custom；按 api_base/host URL 探测厂商专属 env
+   （DEEPSEEK_API_KEY / MIMO_API_KEY 等），再回落通用 MEAPET/OPENAI key。
+    """
     direct = llm_cfg.get("direct") if isinstance(llm_cfg.get("direct"), dict) else {}
-    provider = str(direct.get("provider") or llm_cfg.get("backend") or "custom").lower()
-    names = ENV_LLM_KEY.get(provider, ("MEAPET_API_KEY",))
-    value = resolve_secret(str(direct.get("api_key") or ""), names)
-    return value or resolve_llm_api_key(llm_cfg)
+    api_base = (
+        str(direct.get("api_base") or "").strip()
+        or str(llm_cfg.get("api_base") or "").strip()
+    )
+    host = (
+        str(direct.get("host") or "").strip()
+        or str(llm_cfg.get("host") or "").strip()
+    )
+    url_names = _env_names_for_api_base(api_base, host)
+    if url_names:
+        # 识别出厂商端点：只读该厂商专属变量 + 中立的 MEAPET_API_KEY，
+        # 绝不并入 OPENAI_API_KEY，避免环境里的 OpenAI 密钥压过显式文件密钥
+        # 并被发往 DeepSeek/MiMo/Anthropic 等第三方端点（跨厂商凭据泄露）。
+        env_names = url_names
+    else:
+        env_names = ENV_LLM_KEY
+
+    value = resolve_secret(
+        str(direct.get("api_key") or ""),
+        env_names,
+    )
+    if value:
+        return value
+    return resolve_llm_api_key(llm_cfg)
 
 
 def resolve_tts_api_key(tts_cfg: dict, llm_cfg: Optional[dict] = None) -> str:
-    llm_cfg = llm_cfg or {}
-    resolved = resolve_secret(tts_cfg.get("api_key", ""), ENV_TTS_KEY)
-    if resolved:
-        return resolved
-    if (llm_cfg.get("backend") or "").lower() == "mimo":
-        return resolve_llm_api_key(llm_cfg)
+    """解析 TTS Key；仅当对话端点是 MiMo 地址时才允许复用其密钥。"""
+    key = resolve_secret(tts_cfg.get("api_key", ""), ENV_TTS_KEY)
+    if key:
+        return key
+    llm = llm_cfg or {}
+    if llm_endpoint_family(llm) == "mimo":
+        return resolve_llm_api_key(llm)
     return ""
 
 
@@ -237,29 +419,27 @@ def resolve_vision_backend(
     vision_cfg: dict,
     llm_cfg: Optional[dict] = None,
 ) -> str:
-    """解析实际识图后端；不支持视觉的对话后端安全回退到本地 Ollama。"""
-    llm_cfg = llm_cfg or {}
-    backend = (
-        vision_cfg.get("backend")
-        or llm_cfg.get("backend")
-        or "ollama"
-    ).lower()
-    return backend if backend in SUPPORTED_VISION_BACKENDS else "ollama"
+    """解析视觉后端：显式 vision.backend 优先，其次跟随可识图的对话端点族，
+    否则回退本地 ollama（云端对话端点不支持独立识图跟随）。"""
+    explicit = str(vision_cfg.get("backend") or "").strip().lower()
+    if explicit in _VISION_BACKENDS:
+        return explicit
+    family = llm_endpoint_family(llm_cfg)
+    if family in _VISION_BACKENDS:
+        return family
+    return "ollama"
 
 
 def resolve_vision_api_key(vision_cfg: dict, llm_cfg: Optional[dict] = None) -> str:
-    llm_cfg = llm_cfg or {}
+    """解析视觉 API Key：密钥按端点族隔离，仅同族才允许复用 llm 密钥。"""
     backend = resolve_vision_backend(vision_cfg, llm_cfg)
-    if backend != "mimo":
-        return ""
-    resolved = resolve_secret(
-        vision_cfg.get("api_key", ""),
-        ENV_LLM_KEY["mimo"],
-    )
-    if resolved:
-        return resolved
-    if (llm_cfg.get("backend") or "").lower() == "mimo":
-        return resolve_llm_api_key(llm_cfg)
+    env_names = ENV_VISION_KEY if backend == "mimo" else ()
+    key = resolve_secret(vision_cfg.get("api_key", ""), env_names)
+    if key:
+        return key
+    llm = llm_cfg or {}
+    if llm_endpoint_family(llm) == backend:
+        return resolve_llm_api_key(llm)
     return ""
 
 
@@ -267,31 +447,48 @@ def resolve_vision_api_base(
     vision_cfg: dict,
     llm_cfg: Optional[dict] = None,
 ) -> str:
-    """解析 MiMo 识图地址，禁止继承其它供应商的 API 地址。"""
-    llm_cfg = llm_cfg or {}
-    if resolve_vision_backend(vision_cfg, llm_cfg) != "mimo":
-        return ""
+    """解析视觉 API 地址：显式配置优先；仅同端点族才继承 llm 地址，
+    否则回退该后端自己的默认地址（禁止把截图发往其它厂商的端点）。
+
+    ollama 只认 host：残留的云端 api_base 一律忽略，避免确认走本地、
+    实际上传到 MiMo 默认地址的错位。
+    """
+    backend = resolve_vision_backend(vision_cfg, llm_cfg)
+    if backend == "ollama":
+        return resolve_vision_host(vision_cfg, llm_cfg)
     explicit = (vision_cfg.get("api_base") or "").strip()
     if explicit:
         return explicit
-    if (llm_cfg.get("backend") or "").lower() == "mimo":
-        inherited = (llm_cfg.get("api_base") or "").strip()
+    llm = llm_cfg or {}
+    if llm_endpoint_family(llm) == backend:
+        direct = llm.get("direct") if isinstance(llm.get("direct"), dict) else {}
+        inherited = (
+            str(direct.get("api_base") or "").strip()
+            or str(llm.get("api_base") or "").strip()
+        )
         if inherited:
             return inherited
-    return DEFAULT_MIMO_API_BASE
+    if backend == "mimo":
+        return DEFAULT_MIMO_API_BASE
+    return DEFAULT_API_BASE
 
 
 def resolve_vision_host(
     vision_cfg: dict,
     llm_cfg: Optional[dict] = None,
 ) -> str:
-    """解析 Ollama 识图地址，禁止继承云端对话后端的地址。"""
-    llm_cfg = llm_cfg or {}
+    """解析视觉主机地址：显式配置优先；仅同端点族才继承 llm 主机。"""
     explicit = (vision_cfg.get("host") or "").strip()
     if explicit:
         return explicit
-    if (llm_cfg.get("backend") or "").lower() == "ollama":
-        inherited = (llm_cfg.get("host") or "").strip()
+    backend = resolve_vision_backend(vision_cfg, llm_cfg)
+    llm = llm_cfg or {}
+    if llm_endpoint_family(llm) == backend:
+        direct = llm.get("direct") if isinstance(llm.get("direct"), dict) else {}
+        inherited = (
+            str(direct.get("host") or "").strip()
+            or str(llm.get("host") or "").strip()
+        )
         if inherited:
             return inherited
     return DEFAULT_OLLAMA_HOST
@@ -355,24 +552,92 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 
 def _normalize_llm_contract(value: object) -> dict:
-    """补齐 direct/agent 显式结构，同时保留当前运行路径使用的旧字段。"""
+    """补齐 direct/agent 显式结构，统一使用 OpenAI 标准协议。
+
+    移除旧的 hermes/openclaw kind 分支，agent 段现在只包含
+    OpenAI 兼容字段：base_url / api_key / model / temperature /
+    max_tokens / timeout_seconds / history_turns / tls。
+    """
     llm = copy.deepcopy(value) if isinstance(value, dict) else {}
-    backend = str(llm.get("backend") or "ollama").strip().lower() or "ollama"
+    backend = str(llm.get("backend") or "").strip().lower()
     requested_mode = str(llm.get("mode") or "").strip().lower()
     if requested_mode not in {"direct", "agent"}:
-        requested_mode = "agent" if backend in {"hermes", "openclaw"} else "direct"
+        # 旧配置无 mode：Agent 类 backend 迁去 agent，其余默认 direct
+        requested_mode = "agent" if backend in _AGENT_KINDS else "direct"
 
+    # ---- direct 段 ----
     direct = copy.deepcopy(llm.get("direct")) if isinstance(llm.get("direct"), dict) else {}
-    provider = backend if backend not in {"hermes", "openclaw"} else "ollama"
-    direct.setdefault("provider", provider)
-    direct.setdefault("protocol", "ollama_chat" if provider == "ollama" else "openai_chat")
+    # 身份标签一律 custom；协议/密钥/联动改由 api_base/host 推断。
+    legacy_provider = str(direct.get("provider") or backend or "").strip().lower()
+    direct["provider"] = "custom"
     direct.setdefault("api_base", str(llm.get("api_base") or "").strip())
     direct.setdefault("host", str(llm.get("host") or "").strip())
-    direct.setdefault("model", str(llm.get("model") or "").strip())
     direct.setdefault("api_key", str(llm.get("api_key") or "").strip())
     direct.setdefault("temperature", llm.get("temperature", 0.7))
     direct.setdefault("max_tokens", llm.get("max_tokens", 4096))
-    # 512 是旧模板的默认值，容易截断正常回复；成对出现时视为旧默认迁移。
+    # 供应商自定义请求头：只保留字符串键值，非法结构直接丢弃。
+    raw_headers = direct.get("headers")
+    if isinstance(raw_headers, dict):
+        cleaned_headers = {
+            str(k).strip(): str(v)
+            for k, v in raw_headers.items()
+            if str(k or "").strip()
+        }
+        if cleaned_headers:
+            direct["headers"] = cleaned_headers
+        else:
+            direct.pop("headers", None)
+    else:
+        direct.pop("headers", None)
+    # 高级配置：超时（秒）、按供应商生效的代理、Anthropic 扩展思考。
+    try:
+        timeout_value = float(direct.get("timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        timeout_value = 0.0
+    if timeout_value > 0:
+        direct["timeout_seconds"] = timeout_value
+    else:
+        direct.pop("timeout_seconds", None)
+    proxy_value = str(direct.get("proxy") or "").strip()
+    if proxy_value:
+        direct["proxy"] = proxy_value
+    else:
+        direct.pop("proxy", None)
+    raw_thinking = direct.get("thinking")
+    if isinstance(raw_thinking, dict):
+        thinking_type = str(raw_thinking.get("type") or "").strip().lower()
+        effort = str(raw_thinking.get("effort") or "").strip().lower()
+        try:
+            budget = int(raw_thinking.get("budget") or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        if thinking_type == "adaptive" or budget > 0:
+            cleaned_thinking: Dict[str, object] = {}
+            if thinking_type:
+                cleaned_thinking["type"] = thinking_type
+            if budget > 0:
+                cleaned_thinking["budget"] = budget
+            if effort:
+                cleaned_thinking["effort"] = effort
+            direct["thinking"] = cleaned_thinking
+        else:
+            direct.pop("thinking", None)
+    else:
+        direct.pop("thinking", None)
+    # 显式 protocol 优先；缺省时按端点地址（再回落旧 provider 标签）推断。
+    if not str(direct.get("protocol") or "").strip():
+        direct["protocol"] = infer_direct_protocol(
+            legacy_provider,
+            api_base=direct.get("api_base"),
+            host=direct.get("host"),
+        )
+    else:
+        direct["protocol"] = str(direct.get("protocol") or "").strip().lower()
+    llm_model = str(llm.get("model") or "").strip()
+    if llm_model:
+        direct["model"] = llm_model
+    else:
+        direct.setdefault("model", "")
     try:
         direct_tokens = int(direct.get("max_tokens"))
         legacy_tokens = int(llm.get("max_tokens", 512))
@@ -382,34 +647,69 @@ def _normalize_llm_contract(value: object) -> dict:
         direct["max_tokens"] = 4096
         llm["max_tokens"] = 4096
 
+    # ---- agent 段（OpenAI 兼容） ----
     agent = copy.deepcopy(llm.get("agent")) if isinstance(llm.get("agent"), dict) else {}
-    kind = str(agent.get("kind") or "").strip().lower()
-    if kind not in {"hermes", "openclaw"}:
-        kind = backend if backend in {"hermes", "openclaw"} else "hermes"
-    default_url = (
-        "ws://127.0.0.1:18789"
-        if kind == "openclaw"
-        else "http://127.0.0.1:8642"
-    )
-    agent["kind"] = kind
-    agent.setdefault(
-        "base_url",
-        str(llm.get("bridge_url") or default_url).strip() or default_url,
-    )
-    agent.setdefault("auth_token", "")
-    agent.setdefault("session_id", "")
-    agent.setdefault("session_key", "")
+
+    # base_url 解析优先级：llm.api_base > llm.host > agent.base_url > default
+    # 注意：旧配置中 agent.base_url 指向 Hermes Gateway（:8642）而非 LLM，
+    # 因此 llm 顶层地址必须优先，避免迁移后仍指向旧 Gateway 端口。
+    default_url = "https://api.openai.com/v1"
+    agent_base = str(llm.get("api_base") or "").strip()
+    if not agent_base:
+        agent_base = str(llm.get("host") or "").strip()
+    if not agent_base:
+        agent_base = str(agent.get("base_url") or "").strip()
+    if not agent_base:
+        agent_base = default_url
+    agent["base_url"] = agent_base
+
+    # api_key：agent.api_key > agent.auth_token（旧向导 Bearer Token 迁移）> llm.api_key
+    # 重构后 OpenAIAdapter 只用 agent.api_key 鉴权，而向导后端页仍在收集 auth_token；
+    # 若不迁移，用户填的 Bearer Token 会在下面的 legacy 清理中被静默丢弃。
+    if not str(agent.get("api_key") or "").strip():
+        agent["api_key"] = (
+            str(agent.get("auth_token") or "").strip()
+            or str(llm.get("api_key") or "").strip()
+        )
+
+    # model：agent.model > llm.model > direct.model > fallback
+    agent_model = str(agent.get("model") or "").strip()
+    if not agent_model:
+        agent_model = llm_model or str(direct.get("model") or "").strip()
+    if not agent_model:
+        agent_model = "gpt-4o-mini"
+    agent["model"] = agent_model
+
+    # 通用参数
+    agent.setdefault("temperature", llm.get("temperature", 0.7))
+    agent.setdefault("max_tokens", llm.get("max_tokens", 4096))
+    agent.setdefault("timeout_seconds", 120.0)
     agent.setdefault("history_turns", 5)
-    agent.setdefault("allow_insecure_ws", False)
-    agent.setdefault("identity_path", "")
+
+    # TLS
     tls = copy.deepcopy(agent.get("tls")) if isinstance(agent.get("tls"), dict) else {}
     tls.setdefault("verify", True)
     tls.setdefault("ca_file", "")
     agent["tls"] = tls
 
+    # 清理旧字段（不再需要）
+    for legacy_key in (
+        "kind", "auth_token", "session_id", "session_key",
+        "allow_insecure_ws", "identity_path", "bridge_url",
+    ):
+        agent.pop(legacy_key, None)
+
     llm["mode"] = requested_mode
     llm["direct"] = direct
     llm["agent"] = agent
+    # direct 模式下顶层 backend 与 direct.provider 对齐（恒为 custom）；
+    # agent 模式保留 hermes/openclaw kind，其它旧厂商标签收成 custom。
+    if requested_mode == "direct":
+        llm["backend"] = "custom"
+    elif backend in _AGENT_KINDS:
+        llm["backend"] = backend
+    else:
+        llm["backend"] = "custom"
     return llm
 
 
@@ -438,6 +738,29 @@ def _normalize_agent_control(value: object) -> dict:
     return control
 
 
+def _clamp_ratio(value: object, default: float, lo: float, hi: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    if number != number:  # NaN
+        number = default
+    return max(lo, min(hi, number))
+
+
+def normalize_live2d_window_mask(value: object) -> dict:
+    """规范化 Live2D 椭圆窗口 mask（比例 0–1）。"""
+    raw = value if isinstance(value, dict) else {}
+    defaults = DEFAULT_LIVE2D_WINDOW_MASK
+    return {
+        "enabled": bool(raw.get("enabled", defaults["enabled"])),
+        "cx": _clamp_ratio(raw.get("cx", defaults["cx"]), defaults["cx"], 0.05, 0.95),
+        "cy": _clamp_ratio(raw.get("cy", defaults["cy"]), defaults["cy"], 0.05, 0.95),
+        "rw": _clamp_ratio(raw.get("rw", defaults["rw"]), defaults["rw"], 0.10, 0.55),
+        "rh": _clamp_ratio(raw.get("rh", defaults["rh"]), defaults["rh"], 0.10, 0.55),
+    }
+
+
 def _normalize_reference_audios(tts: dict) -> dict:
     """规范化每语言固定参考音频，并只读迁移旧单条 GSV 配置。"""
     raw_mapping = tts.get("reference_audios")
@@ -461,7 +784,6 @@ def _normalize_reference_audios(tts: dict) -> dict:
     return mapping
 
 
-
 def normalize_config(config: dict) -> dict:
     """补全默认字段、规范化 watcher / bubble / display / tts.sync"""
     cfg = copy.deepcopy(config or {})
@@ -471,7 +793,9 @@ def normalize_config(config: dict) -> dict:
     cfg.setdefault("tts", {})
     cfg.setdefault("display", {})
     cfg.setdefault("character", {})
-    cfg.setdefault("live2d", {})
+    live2d = cfg.get("live2d") if isinstance(cfg.get("live2d"), dict) else {}
+    live2d["window_mask"] = normalize_live2d_window_mask(live2d.get("window_mask"))
+    cfg["live2d"] = live2d
     cfg["agent_control"] = _normalize_agent_control(cfg.get("agent_control"))
 
     # bubble
@@ -484,7 +808,9 @@ def normalize_config(config: dict) -> dict:
     disp = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
     disp.setdefault("scale", 0.5)
     disp.setdefault("fps", 30)
-    disp.setdefault("size_factor", 1.0)
+    disp["size_factor"] = normalize_pet_size_factor(
+        disp.get("size_factor", 1.0)
+    )
     disp["font_scale"] = normalize_ui_font_scale(
         disp.get("font_scale", 1.0)
     )
@@ -515,7 +841,6 @@ def normalize_config(config: dict) -> dict:
         or tts.get("voice_lang")
         or "jp"
     )
-    # 保存用户意图；运行时再按机器翻译组件是否可用决定本轮是否生效。
     tts["prefer_model_voice_translation"] = bool(
         tts.get("prefer_model_voice_translation", True)
     )
@@ -533,7 +858,6 @@ def normalize_config(config: dict) -> dict:
 
     # watcher 统一结构（interval 内嵌，不再用顶层 watcher_interval）
     w_in = cfg.get("watcher") if isinstance(cfg.get("watcher"), dict) else {}
-    # 兼容旧顶层 watcher_interval
     if "interval" not in w_in or not isinstance(w_in.get("interval"), dict):
         top_wi = cfg.get("watcher_interval") if isinstance(cfg.get("watcher_interval"), dict) else {}
         if top_wi:
@@ -543,7 +867,6 @@ def normalize_config(config: dict) -> dict:
                 "max_ms": int(top_wi.get("max_ms", DEFAULT_WATCHER_INTERVAL["max_ms"])),
             }
     w = normalize_watcher(w_in)
-    # normalize_watcher 已含 interval；强制安全底线
     w["require_confirm"] = True
     w["confirm_once_session"] = False
     watcher_out = copy.deepcopy(w_in)
@@ -599,7 +922,6 @@ def normalize_config(config: dict) -> dict:
     if "mode" in vision:
         vision_mode = normalize_vision_mode(vision.get("mode"))
     else:
-        # 旧 watcher 会独立调用视觉模型，因此只能忠实迁移为 relay。
         legacy_enabled = bool(
             vision.get("enabled", watcher_out.get("enabled", False))
         )
@@ -613,10 +935,7 @@ def normalize_config(config: dict) -> dict:
         watcher_out["enabled"] = False
     cfg["vision"] = vision
     cfg["watcher"] = watcher_out
-    # 保留旧 watcher_interval 和未知字段，避免规范化时删除用户配置。
     return cfg
-
-
 
 
 def load_config(path: Optional[str] = None) -> dict:
@@ -634,7 +953,8 @@ def scrub_secrets(config: dict) -> dict:
             direct["api_key"] = ""
         agent = out["llm"].get("agent")
         if isinstance(agent, dict):
-            agent["auth_token"] = ""
+            agent["api_key"] = ""
+            agent["auth_token"] = ""  # 兼容旧字段
     if "tts" in out and isinstance(out["tts"], dict):
         out["tts"]["api_key"] = ""
         out["tts"]["translate_api_key"] = ""
@@ -665,7 +985,7 @@ def secret_status(config: dict) -> Dict[str, str]:
         return "unknown"
 
     return {
-        "llm": src(llm.get("api_key", ""), llm_key, ENV_LLM_KEY.get((llm.get("backend") or "").lower(), ("MEAPET_API_KEY",))),
+        "llm": src(llm.get("api_key", ""), llm_key, ENV_LLM_KEY),
         "tts": src(tts.get("api_key", ""), tts_key, ENV_TTS_KEY),
         "translate": src(tts.get("translate_api_key", ""), tr_key, ENV_TRANSLATE_KEY),
         "vision": src(vision.get("api_key", ""), vis_key, ENV_VISION_KEY),
